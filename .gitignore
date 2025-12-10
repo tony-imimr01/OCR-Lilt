@@ -10,4 +10,5 @@ lilt_classification/
 lilt_text_extraction/
 fingerprints.pkl
 
-/images
+images/
+temp/
