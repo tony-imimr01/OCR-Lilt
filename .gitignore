@@ -8,6 +8,7 @@ __pycache__
 
 lilt_classification/
 lilt_text_extraction/
+lilt_text_extraction_model/
 fingerprints.pkl
 
 images/
