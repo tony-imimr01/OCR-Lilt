@@ -5,11 +5,17 @@ Provides:
 - LiLTPairwiseHead: pairwise token interaction head producing (bs, seq, seq, C) logits
 - LiLTRobertaLikeForRelationExtraction: wrapper around a HuggingFace encoder + pairwise head
 - LiLTRobertaLikeForTokenClassification: wrapper around a HuggingFace encoder + token classification head
+- LiLTRobertaLikeConfig: configuration class for LiLT models
 
 Usage:
-    from models.LiLTRobertaLike import LiLTRobertaLikeForRelationExtraction, LiLTRobertaLikeForTokenClassification
+    from models.LiLTRobertaLike import (
+        LiLTRobertaLikeConfig,
+        LiLTRobertaLikeForRelationExtraction,
+        LiLTRobertaLikeForTokenClassification
+    )
 
-    encoder = AutoModel.from_pretrained("nielsr/lilt-xlm-roberta-base")
+    config = LiLTRobertaLikeConfig.from_pretrained("nielsr/lilt-xlm-roberta-base", num_rel_labels=5)
+    encoder = AutoModel.from_pretrained("nielsr/lilt-xlm-roberta-base", config=config)
     re_model = LiLTRobertaLikeForRelationExtraction(encoder, num_rel_labels=5)
     tc_model = LiLTRobertaLikeForTokenClassification(encoder, num_labels=10)
 
@@ -21,22 +27,165 @@ Usage:
     re_model = LiLTRobertaLikeForRelationExtraction.from_pretrained("out_dir_re", device="cpu")
     tc_model = LiLTRobertaLikeForTokenClassification.from_pretrained("out_dir_tc", device="cpu")
 """
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import json
 import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoConfig, AutoModelForTokenClassification
-from transformers.modeling_outputs import SequenceClassifierOutput, TokenClassifierOutput
+from transformers import (
+    AutoModel, 
+    AutoConfig, 
+    AutoModelForTokenClassification,
+    PretrainedConfig
+)
+from transformers.modeling_outputs import (
+    SequenceClassifierOutput, 
+    TokenClassifierOutput,
+    BaseModelOutputWithPoolingAndCrossAttentions
+)
 
 
 __all__ = [
+    "LiLTRobertaLikeConfig",
     "LiLTPairwiseHead",
     "LiLTRobertaLikeForRelationExtraction",
     "LiLTRobertaLikeForTokenClassification"
 ]
+
+
+class LiLTRobertaLikeConfig(PretrainedConfig):
+    """
+    Configuration class for LiLTRobertaLike models.
+    
+    This is a wrapper around the standard Hugging Face configuration with additional
+    parameters specific to LiLT models for relation extraction and token classification.
+    """
+
+    model_type = "lilt-roberta-like"
+
+    def __init__(
+        self,
+        vocab_size=30522,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=2,
+        initializer_range=0.02,
+        layer_norm_eps=1e-12,
+        pad_token_id=0,
+        bos_token_id=0,
+        eos_token_id=2,
+        num_rel_labels=2,
+        num_labels=2,
+        coordinate_size=128,
+        max_2d_position_embeddings=1024,
+        has_spatial_attention_bias=False,
+        has_visual_segment_embedding=False,
+        use_visual_embeddings=True,
+        **kwargs
+    ):
+        """
+        Initialize LiLTRobertaLikeConfig.
+
+        Args:
+            vocab_size (`int`, *optional*, defaults to 30522):
+                Vocabulary size of the LiLT model. Defines the number of different tokens that can be represented by the
+                `inputs_ids` passed when calling LiLTRobertaLike.
+            hidden_size (`int`, *optional*, defaults to 768):
+                Dimension of the encoder layers and the pooler layer.
+            num_hidden_layers (`int`, *optional*, defaults to 12):
+                Number of hidden layers in the Transformer encoder.
+            num_attention_heads (`int`, *optional*, defaults to 12):
+                Number of attention heads for each attention layer in the Transformer encoder.
+            intermediate_size (`int`, *optional*, defaults to 3072):
+                Dimension of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+            hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
+                The non-linear activation function (function or string) in the encoder and pooler.
+            hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
+                The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+            attention_probs_dropout_prob (`float`, *optional*, defaults to 0.1):
+                The dropout ratio for the attention probabilities.
+            max_position_embeddings (`int`, *optional*, defaults to 512):
+                The maximum sequence length that this model might ever be used with.
+            type_vocab_size (`int`, *optional*, defaults to 2):
+                The vocabulary size of the `token_type_ids` passed when calling LiLTRobertaLike.
+            initializer_range (`float`, *optional*, defaults to 0.02):
+                The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+            layer_norm_eps (`float`, *optional*, defaults to 1e-12):
+                The epsilon used by the layer normalization layers.
+            pad_token_id (`int`, *optional*, defaults to 0):
+                The ID of the token to use as padding.
+            bos_token_id (`int`, *optional*, defaults to 0):
+                The ID of the token to use as beginning of sequence.
+            eos_token_id (`int`, *optional*, defaults to 2):
+                The ID of the token to use as end of sequence.
+            num_rel_labels (`int`, *optional*, defaults to 2):
+                Number of relation labels for relation extraction tasks.
+            num_labels (`int`, *optional*, defaults to 2):
+                Number of labels for token classification tasks.
+            coordinate_size (`int`, *optional*, defaults to 128):
+                Dimension of the coordinate embeddings.
+            max_2d_position_embeddings (`int`, *optional*, defaults to 1024):
+                The maximum value that the 2D position embedding might ever be used with. This is typically the
+                coordinate space (e.g., 1000x1000 for documents).
+            has_spatial_attention_bias (`bool`, *optional*, defaults to False):
+                Whether to use spatial attention bias in the attention mechanism.
+            has_visual_segment_embedding (`bool`, *optional*, defaults to False):
+                Whether to use visual segment embeddings.
+            use_visual_embeddings (`bool`, *optional*, defaults to True):
+                Whether to use visual embeddings in the model.
+            **kwargs:
+                Additional keyword arguments passed to `PretrainedConfig`.
+        """
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
+        
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.hidden_act = hidden_act
+        self.intermediate_size = intermediate_size
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.max_position_embeddings = max_position_embeddings
+        self.type_vocab_size = type_vocab_size
+        self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.num_rel_labels = num_rel_labels
+        self.num_labels = num_labels
+        self.coordinate_size = coordinate_size
+        self.max_2d_position_embeddings = max_2d_position_embeddings
+        self.has_spatial_attention_bias = has_spatial_attention_bias
+        self.has_visual_segment_embedding = has_visual_segment_embedding
+        self.use_visual_embeddings = use_visual_embeddings
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> "PretrainedConfig":
+        """Initialize configuration from pretrained model configuration."""
+        config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        
+        # If there's a config.json file in the pretrained directory, use it
+        if os.path.exists(os.path.join(pretrained_model_name_or_path, "config.json")):
+            with open(os.path.join(pretrained_model_name_or_path, "config.json")) as f:
+                config_dict = json.load(f)
+        
+        # Update with kwargs
+        config_dict.update(kwargs)
+        
+        # Create and return config
+        return cls.from_dict(config_dict, **kwargs)
 
 
 class LiLTPairwiseHead(nn.Module):
