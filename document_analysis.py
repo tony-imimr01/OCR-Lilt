@@ -31,6 +31,8 @@ from collections import defaultdict, Counter
 import numpy as np
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 
+from datetime import datetime
+
 # ---- CUDA / Torch env ----
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -1096,7 +1098,6 @@ class EnhancedQAModel:
 class Verifier:
     def __init__(self, fingerprints_path: Optional[str], lilt_classifier_model_path: Optional[str] = None, fp_threshold: float = 0.85):
         self.fp_threshold = fp_threshold
-
         self.fingerprints = {}
         if fingerprints_path and os.path.exists(fingerprints_path):
             try:
@@ -1104,7 +1105,6 @@ class Verifier:
                     self.fingerprints = pickle.load(f)
                 if not isinstance(self.fingerprints, dict):
                     self.fingerprints = dict(self.fingerprints)
-
                 logger.info(f"Loaded {len(self.fingerprints)} fingerprints")
             except Exception as e:
                 logger.warning(f"Failed to load fingerprints: {e}")
@@ -1114,38 +1114,88 @@ class Verifier:
         # LILT classifier
         self.classifier = None
         self.tokenizer = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if (TORCH_AVAILABLE and torch is not None and torch.cuda.is_available()) else "cpu")
 
         if lilt_classifier_model_path and os.path.exists(lilt_classifier_model_path) and LILT_AVAILABLE:
             try:
                 config = LiLTRobertaLikeConfig.from_pretrained(lilt_classifier_model_path)
                 config.trust_remote_code = True
-                
+
                 self.tokenizer = AutoTokenizer.from_pretrained(
-                    lilt_classifier_model_path, 
+                    lilt_classifier_model_path,
                     use_fast=True,
-                    config=config
+                    config=config,
                 )
-                
+
                 self.classifier = LiLTRobertaLikeForTokenClassification.from_pretrained(
                     lilt_classifier_model_path,
                     config=config,
-                    trust_remote_code=True
+                    trust_remote_code=True,
                 ).to(self.device)
 
                 logger.info("Loaded custom LILT classifier")
-
             except Exception as e:
                 logger.warning(f"Failed to load LILT classifier: {e}")
                 self.classifier = None
                 self.tokenizer = None
 
+    def _get_first_page_image(self, path: str) -> Optional[str]:
+        """Convert first page of PDF to a temporary PNG and return its path, or return original path for images."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext != ".pdf":
+            return path
+
+        if not PDF2IMAGE_AVAILABLE:
+            logger.warning("pdf2image not available; cannot process PDF for verification")
+            return None
+
+        try:
+            poppler_path = os.environ.get("POPPLER_PATH")
+            kwargs = {"poppler_path": poppler_path} if poppler_path else {}
+            pages = convert_from_path(path, dpi=200, **kwargs)
+            if not pages:
+                logger.warning(f"No pages converted from PDF: {path}")
+                return None
+
+            tmp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            pages[0].save(tmp_img.name, format="PNG")
+            tmp_img.close()
+            return tmp_img.name
+        except Exception as e:
+            logger.warning(f"Failed to convert PDF to image for verification: {e}")
+            return None
+
     def verify(self, image_path: str) -> Dict:
         t0 = time.time()
 
-        words, boxes, w, h = ocr_extract_words_bboxes(image_path)
-        preview = " ".join(words)[:400]
+        # Handle PDFs by converting first page to image
+        processed_path = self._get_first_page_image(image_path)
+        if processed_path is None:
+            # Fallback: no OCR possible, return dummy result
+            return {
+                "filename": os.path.basename(image_path),
+                "predicted_class": "Unknown",
+                "confidence": 0.0,
+                "form_name": "Unknown",
+                "in_training_data": False,
+                "training_similarity": 0.0,
+                "training_info": "No OCR available for given file",
+                "extracted_text_preview": "",
+                "processing_time": time.time() - t0,
+                "method": "hybrid",
+            }
 
+        try:
+            words, boxes, w, h = ocr_extract_words_bboxes(processed_path)
+        finally:
+            # Delete temporary image if created
+            if processed_path != image_path and os.path.exists(processed_path):
+                try:
+                    os.remove(processed_path)
+                except Exception:
+                    pass
+
+        preview = " ".join(words)[:400]
         query_fp = generate_fingerprint(words, boxes, w, h)
 
         best_fp_score = 0.0
@@ -1163,7 +1213,6 @@ class Verifier:
 
         if best_fp_score >= self.fp_threshold:
             label, conf = self._predict_label(preview)
-
             return {
                 "filename": os.path.basename(image_path),
                 "predicted_class": label,
@@ -1178,7 +1227,6 @@ class Verifier:
             }
 
         label, conf = self._predict_label(preview)
-
         return {
             "filename": os.path.basename(image_path),
             "predicted_class": label,
@@ -1540,7 +1588,6 @@ class FormFieldDetector:
         checkbox_patterns = [
             r"replacement.*copy.*certificate.*registration.*generating.*facility.*due.*to",
             r"damage.*\(.*damaged.*certificate.*must.*returned.*deletion.*\)",
-            r"掼毁.*琨有损毁澄明善必须交遣本署鞋艄.*damage",
         ]
         
         checkbox_candidates = []
@@ -2032,6 +2079,585 @@ app = FastAPI(title="Document Analysis API - Combined LiLT + Verification")
 
 
 # ------- Combined endpoints -------
+#!/usr/bin/env python3
+"""
+Fixed API endpoint that produces only ONE field result per key_field in result.json
+"""
+
+from typing import List, Optional, Dict
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import tempfile
+import os
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ------- Models -------
+class BoundingBox(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+class ExtractedEntity(BaseModel):
+    field: str
+    value: str
+    bbox: BoundingBox
+    confidence: float
+    page_number: int = 1
+    semantic_type: Optional[str] = None
+    semantic_confidence: Optional[float] = None
+
+class DataField(BaseModel):
+    field_name: str
+    field_type: str
+    value: str
+    confidence: float
+    bbox: BoundingBox
+
+class KeyFieldResult(BaseModel):
+    field_name: str
+    value: str
+    structured_value: Optional[DataField] = None
+    confidence: float
+    bbox: BoundingBox
+    context_entities: List[ExtractedEntity] = []
+    meta: Optional[Dict] = None
+    extraction_method: Optional[str] = None
+
+class ExtractionResult(BaseModel):
+    document_name: str
+    page_count: int
+    total_entities: int
+    entities: List[ExtractedEntity]
+    key_field_result: Optional[KeyFieldResult] = None
+    full_text_snippet: str
+    processing_time: float
+    language_used: str
+    model_used: bool
+
+class VerificationResult(BaseModel):
+    filename: str
+    predicted_class: str
+    confidence: float
+    form_name: str
+    in_training_data: bool
+    training_similarity: float
+    training_info: str
+    extracted_text_preview: str
+    processing_time: float
+    method: str
+
+class MultiKeyFieldResult(BaseModel):
+    key_field: str
+    extraction: Optional[ExtractionResult] = None
+    error: Optional[str] = None
+
+class GetDataResponse(BaseModel):
+    status: str
+    message: str
+    results: List[MultiKeyFieldResult]
+    verification: Optional[VerificationResult] = None
+    error: Optional[str] = None
+
+# ------- Helper Functions -------
+
+def validate_bbox(bbox_data: Dict) -> bool:
+    """Validate bbox has required fields and valid values."""
+    if not isinstance(bbox_data, dict):
+        return False
+    required = ["x", "y", "width", "height"]
+    if not all(k in bbox_data for k in required):
+        return False
+    try:
+        w = float(bbox_data["width"])
+        h = float(bbox_data["height"])
+        return w > 0 and h > 0
+    except (ValueError, TypeError):
+        return False
+
+def _scale_bbox_to_target(
+    bbox: Dict, 
+    orig_width: int, 
+    orig_height: int,
+    target_width: int = 1654, 
+    target_height: int = 2339
+) -> Dict:
+    """Scale bbox coordinates to target page size 1654x2339."""
+    x = float(bbox.get("x", 0))
+    y = float(bbox.get("y", 0))
+    width = float(bbox.get("width", 0))
+    height = float(bbox.get("height", 0))
+    
+    scale_x = target_width / max(1, orig_width)
+    scale_y = target_height / max(1, orig_height)
+   
+    return {
+        "x": int(round(x * scale_x)),
+        "y": int(round(y * scale_y)),
+        "width": int(round(width * scale_x)),
+        "height": int(round(height * scale_y)),
+        "confidence": bbox.get("confidence", 1.0)
+    }
+
+def _build_result_json_payload(
+    results: List[MultiKeyFieldResult],
+    verification_result: Optional[VerificationResult],
+    document_width: int,
+    document_height: int
+) -> dict:
+    """
+    Build JSON payload for result.json with scaled bboxes.
+    
+    CRITICAL FIX: Only include ONE field per key_field (the key_field_result)
+    NOT all entities, which was causing duplicates.
+    """
+    out: dict = {
+        "form_name": None,
+        "document_dimensions": {
+            "width": document_width, 
+            "height": document_height
+        },
+        "target_dimensions": {
+            "width": 1654, 
+            "height": 2339
+        },
+        "fields": [],
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    # Form name from verification (if any)
+    if verification_result is not None:
+        out["form_name"] = verification_result.form_name
+
+    # FIXED: Only add key_field_result (master field), NOT all entities
+    for item in results:
+        if not item.extraction:
+            continue
+        
+        extraction = item.extraction
+
+        # Only process key_field_result (the main field we're looking for)
+        if extraction.key_field_result is not None:
+            kf = extraction.key_field_result
+            
+            # Scale bbox to target dimensions
+            scaled_bbox = _scale_bbox_to_target(
+                {
+                    "x": kf.bbox.x, 
+                    "y": kf.bbox.y, 
+                    "width": kf.bbox.width, 
+                    "height": kf.bbox.height,
+                    "confidence": kf.confidence
+                },
+                document_width, 
+                document_height
+            )
+            
+            # Add single field entry for this key_field
+            field_entry = {
+                "key_field": item.key_field,
+                "field_name": kf.field_name,
+                "value": kf.value,
+                "confidence": kf.confidence,
+                "bbox": scaled_bbox,
+            }
+            
+            # Optionally include extraction method and metadata
+            if kf.extraction_method:
+                field_entry["extraction_method"] = kf.extraction_method
+            if kf.meta:
+                field_entry["meta"] = kf.meta
+            
+            # If there's structured_value, include it
+            if kf.structured_value:
+                sv = kf.structured_value
+                scaled_sv_bbox = _scale_bbox_to_target(
+                    {
+                        "x": sv.bbox.x,
+                        "y": sv.bbox.y,
+                        "width": sv.bbox.width,
+                        "height": sv.bbox.height
+                    },
+                    document_width,
+                    document_height
+                )
+                field_entry["structured_value"] = {
+                    "field_name": sv.field_name,
+                    "field_type": sv.field_type,
+                    "value": sv.value,
+                    "confidence": sv.confidence,
+                    "bbox": scaled_sv_bbox
+                }
+            
+            out["fields"].append(field_entry)
+        else:
+            # If no key_field_result found, log a warning
+            logger.warning(
+                f"No key_field_result found for key_field '{item.key_field}'"
+            )
+
+    return out
+
+def _validate_and_normalize_langs(language: Optional[str]) -> str:
+    """Validate and normalize language input."""
+    if not language:
+        return "eng"
+    
+    # Normalize to lowercase and remove spaces
+    langs = language.lower().strip()
+    
+    # Map common language codes
+    lang_map = {
+        "en": "eng",
+        "english": "eng",
+        "zh": "chi_sim",
+        "chinese": "chi_sim",
+        "ja": "jpn",
+        "japanese": "jpn",
+        "ko": "kor",
+        "korean": "kor",
+        "es": "spa",
+        "spanish": "spa",
+        "fr": "fra",
+        "french": "fra",
+        "de": "deu",
+        "german": "deu",
+    }
+    
+    return lang_map.get(langs, langs)
+
+# ------- API Endpoint -------
+
+app = FastAPI()
+
+# ------- Combined endpoints -------
+class MultiKeyFieldResult(BaseModel):
+    key_field: str
+    extraction: Optional[ExtractionResult] = None
+    error: Optional[str] = None
+
+class GetDataResponse(BaseModel):
+    status: str
+    message: str
+    results: List[MultiKeyFieldResult]
+    verification: Optional[VerificationResult] = None
+    error: Optional[str] = None
+
+def bboxes_overlap(bbox1: Dict, bbox2: Dict, threshold: float = 0.5) -> bool:
+    x1, y1, w1, h1 = bbox1["x"], bbox1["y"], bbox1["width"], bbox1["height"]
+    x2, y2, w2, h2 = bbox2["x"], bbox2["y"], bbox2["width"], bbox2["height"]
+
+    # Intersection
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+
+    if xi2 <= xi1 or yi2 <= yi1:
+        return False
+
+    inter_area = (xi2 - xi1) * (yi2 - yi1)
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union_area = area1 + area2 - inter_area
+
+    iou = inter_area / union_area if union_area > 0 else 0
+    return iou > threshold
+
+def _build_result_json_payload(
+    key_fields: List[str],
+    results: List[MultiKeyFieldResult],
+    verification_result: Optional[VerificationResult],
+    document_width: int,
+    document_height: int
+) -> dict:
+    out = {
+        "form_name": verification_result.form_name if verification_result else None,
+        "document_dimensions": {"width": document_width, "height": document_height},
+        "target_dimensions": {"width": 1654, "height": 2339},
+        "fields": [],
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    # Build lookup map
+    result_map = {r.key_field: r for r in results}
+
+    logger.info(f"Building result.json for {len(key_fields)} key fields")
+
+    for idx, kf in enumerate(key_fields):
+        item = result_map.get(kf)
+
+        if item and item.extraction and item.extraction.key_field_result:
+            kfr = item.extraction.key_field_result
+            raw_bbox = {"x": kfr.bbox.x, "y": kfr.bbox.y,
+                        "width": kfr.bbox.width, "height": kfr.bbox.height}
+            scaled_bbox = _scale_bbox_to_target(raw_bbox, document_width, document_height)
+
+            out["fields"].append({
+                "key_field": kf,
+                "field_name": kfr.field_name or kf,
+                "value": kfr.value or "",
+                "confidence": round(float(kfr.confidence or 0.0), 4),
+                "bbox": scaled_bbox,
+                "found": True,
+                "index": idx + 1
+            })
+        else:
+            # Always include missing ones
+            placeholder = _scale_bbox_to_target(
+                {"x": 0, "y": 0, "width": 1, "height": 1},
+                document_width, document_height
+            )
+            out["fields"].append({
+                "key_field": kf,
+                "field_name": kf,
+                "value": "",
+                "confidence": 0.0,
+                "bbox": placeholder,
+                "found": False,
+                "error": item.error if item and item.error else "Not detected",
+                "index": idx + 1
+            })
+
+    logger.info(f"Generated {len(out['fields'])} fields in result.json")
+    return out
+
+@app.post("/api/get_data", response_model=GetDataResponse)
+async def get_data_api(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """
+    Combined endpoint:
+    - Read key_field values line-by-line from key_field.txt
+    - For each key_field, run DocumentAnalyzer.analyze_file
+    - Also run Verifier.verify once on the same file
+    - Save aggregated data into result.json with bboxes scaled to 1654x2339
+    """
+    tmp_path = None
+    document_width = 0
+    document_height = 0
+    
+    try:
+        # Check analyzer and verifier availability
+        if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
+            raise HTTPException(503, "Analyzer not initialized")
+        if not hasattr(app.state, "verifier") or app.state.verifier is None:
+            raise HTTPException(503, "Verifier not initialized")
+
+        # Validate file type
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
+            raise HTTPException(400, "Unsupported file type")
+
+        # Save uploaded file to temp path
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            content = await file.read()
+            if not content:
+                raise HTTPException(400, "Empty file")
+            tf.write(content)
+            tmp_path = tf.name
+
+        # Get document dimensions from first page (for bbox scaling)
+        try:
+            from PIL import Image
+            img = Image.open(tmp_path)
+            document_width, document_height = img.size
+            logger.info(f"Document dimensions: {document_width}x{document_height}")
+        except Exception:
+            document_width, document_height = 1654, 2339  # fallback
+
+        # Normalized language
+        langs_norm = _validate_and_normalize_langs(language)
+
+        analyzer: DocumentAnalyzer = app.state.analyzer
+        verifier: Verifier = app.state.verifier
+
+        # Load key_field list from key_field.txt (one per line, strip blanks)
+        key_fields: List[str] = []
+        try:
+            with open("key_field.txt", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        key_fields.append(line)
+        except FileNotFoundError:
+            logger.warning("key_field.txt not found; using empty key_field list")
+            key_fields = []
+
+        results: List[MultiKeyFieldResult] = []
+
+        # Run analysis for each key_field
+        for kf in key_fields:
+            try:
+                result = analyzer.analyze_file(tmp_path, kf, language_input=langs_norm)
+
+                # Convert entities
+                entities_model: List[ExtractedEntity] = []
+                for e in result.get("entities", []):
+                    try:
+                        bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 0, "height": 0})
+                        if not validate_bbox(bbox_data):
+                            bbox_data = {"x": 0, "y": 0, "width": 1, "height": 1}
+                        entities_model.append(
+                            ExtractedEntity(
+                                field=e.get("field", ""),
+                                value=e.get("value", ""),
+                                bbox=BoundingBox(**bbox_data),
+                                confidence=float(e.get("confidence", 0.0)),
+                                page_number=int(e.get("page_number", 1)),
+                                semantic_type=e.get("semantic_type"),
+                                semantic_confidence=e.get("semantic_confidence"),
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Entity conversion failed for key_field '{kf}': {exc}"
+                        )
+                        continue
+
+                # Convert key_field_result, if any
+                kfr_model = None
+                if result.get("key_field_result"):
+                    kf_res = result["key_field_result"]
+                    try:
+                        bbox_data = kf_res.get(
+                            "bbox", {"x": 0, "y": 0, "width": 0, "height": 0}
+                        )
+                        if not validate_bbox(bbox_data):
+                            bbox_data = {"x": 0, "y": 0, "width": 1, "height": 1}
+                        structured_value = None
+                        if kf_res.get("structured_value"):
+                            sv = kf_res["structured_value"]
+                            structured_value = DataField(
+                                field_name=sv["field_name"],
+                                field_type=sv["field_type"],
+                                value=sv["value"],
+                                confidence=float(sv["confidence"]),
+                                bbox=BoundingBox(
+                                    **sv.get(
+                                        "bbox",
+                                        {"x": 0, "y": 0, "width": 1, "height": 1},
+                                    )
+                                ),
+                            )
+                        kfr_model = KeyFieldResult(
+                            field_name=kf_res["field_name"],
+                            value=kf_res["value"],
+                            structured_value=structured_value,
+                            confidence=float(kf_res["confidence"]),
+                            bbox=BoundingBox(**bbox_data),
+                            context_entities=[],
+                            meta=kf_res.get("meta"),
+                            extraction_method=kf_res.get("extraction_method"),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Key field result conversion failed for key_field '{kf}': {exc}"
+                        )
+                        kfr_model = None
+
+                extraction = ExtractionResult(
+                    document_name=result.get("document_name", ""),
+                    page_count=result.get("page_count", 0),
+                    total_entities=result.get("total_entities", 0),
+                    entities=entities_model,
+                    key_field_result=kfr_model,
+                    full_text_snippet=(
+                        result.get("full_text", "")[:1000]
+                        + ("..." if len(result.get("full_text", "")) > 1000 else "")
+                    ),
+                    processing_time=float(result.get("processing_time", 0.0)),
+                    language_used=result.get("language_used", "eng"),
+                    model_used=result.get("model_used", False),
+                )
+
+                results.append(
+                    MultiKeyFieldResult(
+                        key_field=kf,
+                        extraction=extraction,
+                        error=None,
+                    )
+                )
+            except Exception as e:
+                logger.exception("Analysis failed for key_field '%s': %s", kf, e)
+                results.append(
+                    MultiKeyFieldResult(
+                        key_field=kf,
+                        extraction=None,
+                        error=str(e),
+                    )
+                )
+
+        # Run verifier on the same file (once)
+        verification_result: Optional[VerificationResult] = None
+        try:
+            v_res = verifier.verify(tmp_path)
+            verification_result = VerificationResult(
+                filename=v_res.get("filename", os.path.basename(file.filename)),
+                predicted_class=v_res.get("predicted_class", "Unknown"),
+                confidence=float(v_res.get("confidence", 0.0)),
+                form_name=v_res.get("form_name", "Unknown"),
+                in_training_data=bool(v_res.get("in_training_data", False)),
+                training_similarity=float(v_res.get("training_similarity", 0.0)),
+                training_info=v_res.get("training_info", ""),
+                extracted_text_preview=v_res.get("extracted_text_preview", ""),
+                processing_time=float(v_res.get("processing_time", 0.0)),
+                method=v_res.get("method", "hybrid"),
+            )
+        except Exception as e:
+            logger.exception("Verification failed: %s", e)
+
+        # ---- Save to result.json with scaled bboxes ----
+        try:
+            payload = _build_result_json_payload(
+                key_fields=key_fields,                  # ← NEW: First argument
+                results=results,
+                verification_result=verification_result,
+                document_width=document_width,
+                document_height=document_height
+            )
+            with open("result.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved result.json with {len(payload['fields'])} fields (matches key_field.txt)")
+        except Exception as e:
+            logger.warning(f"Failed to write result.json: {e}")
+
+        msg = f"Processed {len(results)} key_fields"
+        if verification_result is not None:
+            msg += f" with verification (form: {verification_result.form_name})"
+
+        return GetDataResponse(
+            status="success",
+            message=msg,
+            results=results,
+            verification=verification_result,
+            error=None,
+        )
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception("get_data_api error: %s", e)
+        return GetDataResponse(
+            status="error",
+            message="internal error",
+            results=[],
+            verification=None,
+            error=str(e),
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+       
 @app.post("/api/extract-text", response_model=AnalysisResponse)
 async def extract_text_api(
     file: UploadFile = File(...),
