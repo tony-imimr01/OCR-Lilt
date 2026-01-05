@@ -200,6 +200,7 @@ class VerificationResult(BaseModel):
     predicted_class: str
     confidence: float
     form_name: str
+    classication_type: str
     in_training_data: bool
     training_similarity: float
     training_info: str
@@ -1395,10 +1396,12 @@ class FormFieldDetector:
             for match in matches:
                 if '@' in match and len(match) > 3:
                     email = match.strip()
-                    if not any(email.endswith(ext) for ext in ['.com', '.net', '.org', '.edu', '.gov', '.io', '.co', '.hk']):
-                        return email
+                    #if not any(email.endswith(ext) for ext in ['.com', '.net', '.org', '.edu', '.gov', '.io', '.co', '.hk']):
+                    #    return email
                     return email
         return None
+    def has_excessive_spaces(self, text: str) -> bool:
+        return " " not in text
     def _normalize_text_for_matching(self, text: str) -> str:
         if not text:
             return ""
@@ -1450,6 +1453,7 @@ class FormFieldDetector:
         intersection = len(words1.intersection(words2))
         union = len(words1.union(words2))
         return intersection / union if union > 0 else 0.0
+    import re
     def _find_nearest_value_entity(self, entities: List[Dict], label_entity: Dict, label_text: str) -> Optional[Dict]:
         if not label_entity:
             return None
@@ -1910,7 +1914,7 @@ class FormFieldDetector:
             "meta": {"reason": "No checkbox options found after filtering"},
         }
         return [empty_result], [empty_result]
-    
+       
     def detect_field(self, entities: List[Dict], key_field: str) -> Tuple[Union[Dict, List[Dict], None], List[Dict]]:
         logger.info(f"Detecting field: '{key_field}'")
         logger.info(f"Total entities: {len(entities)}")
@@ -2023,9 +2027,11 @@ class FormFieldDetector:
                                 candidates.append((email_val, e2))
             if not candidates:
                 for e in entities:
-                    email_val = self._extract_email(e.get("value", ""))
-                    if email_val:
-                        candidates.append((email_val, e))
+                    v = e.get("value", {})
+                    if self.has_excessive_spaces(v):
+                        email_val = self._extract_email(e.get("value", ""))                        
+                        if email_val:
+                            candidates.append((email_val, e))
             if candidates:
                 email_val, ent = candidates[0]
                 logger.info(f"Detected email value: {email_val}")
@@ -2279,6 +2285,7 @@ class VerificationResult(BaseModel):
     predicted_class: str
     confidence: float
     form_name: str
+    classification_type: str
     in_training_data: bool
     training_similarity: float
     training_info: str
@@ -2343,6 +2350,7 @@ def _build_result_json_payload(
     """Build result.json: ONE FIELD PER KEY_FIELD + PAGE NUMBER."""
     out = {
         "form_name": verification_result.form_name if verification_result else None,
+        "classification_type": verification_result.classification_type if verification_result else None,
         "document_dimensions": {"width": document_width, "height": document_height},
         "target_dimensions": {"width": 1654, "height": 2339},
         "total_key_fields": len(key_fields),
@@ -2354,9 +2362,14 @@ def _build_result_json_payload(
             "pages": 1
         }
     }
+    
     # Build lookup map
     result_map = {r.key_field: r for r in results}
     logger.info(f"Building result.json for {len(key_fields)} key fields")
+    
+    # Initialize sequential index counter
+    next_index = 1
+    
     for idx, kf in enumerate(key_fields):
         item = result_map.get(kf)
         page_number = 1
@@ -2370,15 +2383,15 @@ def _build_result_json_payload(
                 for sub_idx, checkbox_result in enumerate(kfr):
                     page_number = getattr(checkbox_result, 'page_number', 1) or 1
                     raw_bbox = {
-                        "x": checkbox_result.bbox.x, 
+                        "x": checkbox_result.bbox.x,
                         "y": checkbox_result.bbox.y,
-                        "width": checkbox_result.bbox.width, 
+                        "width": checkbox_result.bbox.width,
                         "height": checkbox_result.bbox.height
                     }
                     scaled_bbox = _scale_bbox_to_target(raw_bbox, document_width, document_height)
                     
                     out["fields"].append({
-                        "index": len(out["fields"]) + 1,
+                        "index": next_index,
                         "key_field": checkbox_result.field_name,
                         "field_name": checkbox_result.field_name,
                         "value": checkbox_result.value or "",
@@ -2388,6 +2401,7 @@ def _build_result_json_payload(
                         "found": True,
                         "source": "individual_checkbox"
                     })
+                    next_index += 1
                     found = True
             
             # Handle single result
@@ -2400,7 +2414,7 @@ def _build_result_json_payload(
                 scaled_bbox = _scale_bbox_to_target(raw_bbox, document_width, document_height)
                 
                 out["fields"].append({
-                    "index": idx + 1,
+                    "index": next_index,
                     "key_field": kf,
                     "field_name": kfr.field_name or kf,
                     "value": kfr.value or "",
@@ -2410,6 +2424,7 @@ def _build_result_json_payload(
                     "found": True,
                     "source": "key_field_result"
                 })
+                next_index += 1
                 found = True
         
         if not found:
@@ -2419,7 +2434,7 @@ def _build_result_json_payload(
                 document_width, document_height
             )
             out["fields"].append({
-                "index": idx + 1,
+                "index": next_index,
                 "key_field": kf,
                 "field_name": kf,
                 "value": "",
@@ -2430,14 +2445,17 @@ def _build_result_json_payload(
                 "error": item.error if item and item.error else "Not detected",
                 "source": "missing"
             })
+            next_index += 1
     
-    # Update stats
+    # Update stats (now we count based on "found" field)
     found_count = sum(1 for f in out["fields"] if f["found"])
     out["stats"]["found"] = found_count
     out["stats"]["missing"] = len(key_fields) - found_count
     
-    # Sort by index (matches key_field.txt order)
+    # No need to sort by index anymore since we've maintained sequential order
+    # But keep this for backward compatibility
     out["fields"].sort(key=lambda f: f["index"])
+    
     logger.info(f"result.json: {found_count}/{len(key_fields)} fields found")
     return out
 
@@ -2445,32 +2463,41 @@ import csv
 
 FORM_NAME_CSV_PATH = "form_name_mapping.csv"  # adjust path as needed
 
-def map_form_name_via_csv(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> str:
+def map_form_display(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> Tuple[str, str]:
     """
-    Map raw form_name to display form_name using a CSV file.
-    CSV format: first column = raw form_name, second column = mapped display name.
-    If no match, returns raw_form_name unchanged.
+    Lookup raw_form_name in CSV col1, return col2 (display_form_name) and col3 (display_classification_type).
+    
+    CSV format (3 columns per row):
+    raw_form_name,display_form_name,display_classification_type
+    
+    Input: "FC0005_Test_page_1.png"
+    Output: ("FORM GF2", "EMSD")
     """
-    if not raw_form_name:
-        return "Unknown"
+    if not raw_form_name or raw_form_name == "Unknown":
+        return "Unknown", "Unknown"
     
     try:
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             for row in reader:
-                if len(row) < 2:
+                if len(row) < 3:
                     continue
+                
                 key = row[0].strip()
-                value = row[1].strip()
-                if key and key.lower() == raw_form_name.strip().lower():
-                    return value or raw_form_name
+                form_display = row[1].strip()
+                class_display = row[2].strip()
+                
+                # Exact match (case-sensitive for filenames)
+                if key == raw_form_name.strip():
+                    return form_display or raw_form_name, class_display or "Unknown"
+                    
     except FileNotFoundError:
-        logger.warning(f"Form name mapping CSV not found: {csv_path}")
+        logger.warning(f"CSV not found: {csv_path}")
     except Exception as e:
-        logger.warning(f"Form name mapping CSV read error: {e}")
+        logger.warning(f"CSV read error: {e}")
     
-    # Fallback: return original if no mapping
-    return raw_form_name
+    # No match: return original
+    return raw_form_name, "Unknown"
 
 @app.post("/api/get_data")
 async def get_data_api(
@@ -2635,12 +2662,13 @@ async def get_data_api(
         try:
             v_res = verifier.verify(tmp_path)  
             raw_form_name = v_res.get("form_name", "Unknown")
-            mapped_form_name = map_form_name_via_csv(raw_form_name)
+            mapped_form_name, mapped_classication_type = map_form_display(raw_form_name)
             verification_result = VerificationResult(
                 filename=v_res.get("filename", file.filename),
                 predicted_class=v_res.get("predicted_class", "Unknown"),
                 confidence=float(v_res.get("confidence", 0.0)),
                 form_name=mapped_form_name,  # ✅ mapped via CSV
+                classification_type=mapped_classication_type,
                 in_training_data=bool(v_res.get("in_training_data", False)),
                 training_similarity=float(v_res.get("training_similarity", 0.0)),
                 training_info=v_res.get("training_info", ""),
