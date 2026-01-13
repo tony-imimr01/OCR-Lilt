@@ -29,6 +29,8 @@ import numpy as np
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from datetime import datetime
 
+from extract_field import DocumentFieldExtractor
+
 # ---- CUDA / Torch env ----
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -84,6 +86,8 @@ try:
     EASYOCR_AVAILABLE = True
 except Exception:
     easyocr = None
+
+LILT_MODEL = None
 
 # LiLT models
 LILT_AVAILABLE = False
@@ -1401,6 +1405,7 @@ class FormFieldDetector:
                     return email
         return None
     def has_excessive_spaces(self, text: str) -> bool:
+        #logger.warning(f"text: {text}")
         return " " not in text
     def _normalize_text_for_matching(self, text: str) -> str:
         if not text:
@@ -2546,16 +2551,20 @@ async def get_data_api(
         except Exception as e:
             logger.warning(f"Dimension extraction failed ({e}), using default")
             document_width, document_height = 1654, 2339
+
+        OUTPUT_FILE = "extracted_fields.txt"   # <-- Output file
+        success = run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
+
         langs_norm = _validate_and_normalize_langs(language)
         analyzer = app.state.analyzer
         verifier = app.state.verifier
         # Load key_fields from key_field.txt
         key_fields: List[str] = []
         try:
-            with open("key_field.txt", "r", encoding="utf-8") as f:
+            with open("extracted_fields.txt", "r", encoding="utf-8") as f:
                 key_fields = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
-            logger.warning("key_field.txt not found")
+            logger.warning("extracted_fields.txt not found")
             key_fields = []
         results: List[MultiKeyFieldResult] = []
         # Analyze each key_field
@@ -2729,6 +2738,46 @@ async def health_check():
         "pdf2image_available": PDF2IMAGE_AVAILABLE,
     }
     return JSONResponse(content=status)
+
+def run_extraction(document_path: str, model_path: str, output_file: str = "fields.txt"):
+    """
+    Run field extraction on a document using the DocumentFieldExtractor.
+    
+    Args:
+        document_path (str): Path to input PDF or image file.
+        model_path (str): Path to model directory (can be dummy path since fallback is used).
+        output_file (str): Output file to save extracted fields (default: fields.txt)
+    
+    Returns:
+        bool: True if successful, False otherwise.
+    """
+    if not os.path.exists(document_path):
+        print(f"ERROR: Document not found: {document_path}")
+        return False
+
+    # Supported extensions check
+    supported_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
+    ext = os.path.splitext(document_path)[1].lower()
+    if ext not in supported_ext:
+        print(f"ERROR: Unsupported file type: {ext}")
+        return False
+
+    try:
+        print("Initializing extractor...")
+        extractor = DocumentFieldExtractor(model_path=model_path)
+
+        print("Extracting fields...")
+        fields = extractor.extract_fields(document_path)
+
+        print(f"Saving results to {output_file}...")
+        success = extractor.save_fields(fields, output_file)
+
+    except Exception as e:
+        print(f"Error during extraction: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 # ------- Main -------
 def main():
     parser = argparse.ArgumentParser(
