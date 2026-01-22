@@ -28,12 +28,15 @@ from collections import defaultdict, Counter
 import numpy as np
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from datetime import datetime
-
-from extract_field import DocumentFieldExtractor
+from math import sqrt
 
 # ---- CUDA / Torch env ----
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
+# Add these for memory management
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+os.environ["CUDA_EMPTY_CACHE"] = "1"
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -87,8 +90,6 @@ try:
 except Exception:
     easyocr = None
 
-LILT_MODEL = None
-
 # LiLT models
 LILT_AVAILABLE = False
 try:
@@ -122,6 +123,17 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("combined_document_analysis_api")
+
+def manage_gpu_memory():
+    """Clear GPU memory and optimize usage"""
+    if torch and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            # Set memory fraction if needed
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of GPU memory
+            logger.info("GPU memory managed and cache cleared")
+        except Exception as e:
+            logger.warning(f"GPU memory management failed: {e}")
 
 # ------- Constants / Config -------
 class EntityTypes:
@@ -488,90 +500,126 @@ def clean_extracted_entities(entities: List[Dict]) -> List[Dict]:
     return cleaned
 
 def is_checkbox_option(text: str) -> bool:
-    """Check if text looks like a checkbox option"""
     if not text:
         return False
     text_lower = text.lower().strip()
+    
+    # Skip headers
     skip_patterns = [
-        r"tick.*box.*only",
-        r"please.*tick",
-        r"appropriate.*box",
-        r"only.*one.*allowed",
-        r"hereby.*apply.*following",
-        r"receipt.*date",
-        r"receipt.*number",
-        r"application.*fee",
-        r"section.*[a-z]",
-        r"general.*information",
-        r"name.*organization",
-        r"contact.*tel",
-        r"email.*address",
-        r"government.*hong.*kong",
-        r"electricity.*ordinance",
-        r"registration.*regulations",
-        r"certificate.*of",
-        r"generating.*facility",
+        r"tick.*box", r"please.*tick", r"section.*[a-z]",
+        r"general.*information", r"name.*organization"
     ]
-    for pattern in skip_patterns:
-        if re.search(pattern, text_lower, re.IGNORECASE):
+    for p in skip_patterns:
+        if re.search(p, text_lower, re.IGNORECASE):
             return False
-    checkbox_patterns = [
-        r"^loss.*certificate.*$",
-        r"^replacement.*copy.*certificate.*registration.*generating.*facility.*due.*to$",
-        r"^damage.*\(.*damaged.*certificate.*must.*returned.*deletion.*\)$",
+    
+    # Keywords
+    keywords = ["loss", "damage", "replacement", "deletion", "certificate", "facility"]
+    keyword_count = sum(1 for k in keywords if k in text_lower)
+    has_paren = "(" in text and ")" in text
+    
+    # Accept if:
+    # - Has parentheses + keyword, OR
+    # - At least 1 keyword and length >= 4, OR
+    # - Matches known pattern
+    patterns = [
+        r".*certificate",
+        r"damaged.*\(.*certificate.*deletion",
+        r"replacement.*copy.*certificate",
+        r"deletion.*facility"
     ]
-    has_checkmark = any(symbol in text for symbol in ["✓", "✔", "☑", "√"])
-    for pattern in checkbox_patterns:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            return True
-    has_parentheses = "(" in text and ")" in text
-    content_words = ["loss", "damage", "replacement", "deletion", "returned", "certificate"]
-    content_count = sum(1 for word in content_words if word in text_lower)
-    text_len = len(text)
-    if text_len < 20 or text_len > 300:
-        return False
-    return (content_count >= 2) or (has_parentheses and content_count >= 1) or has_checkmark
+    matches_pattern = any(re.search(p, text_lower, re.IGNORECASE) for p in patterns)
+    
+    return (
+        matches_pattern or
+        (has_paren and keyword_count >= 1) or
+        (keyword_count >= 1 and len(text) >= 4)
+    )
 
 def find_checkbox_region(entities: List[Dict]) -> Tuple[int, int, int, int]:
-    """Find the bounding box of the checkbox section"""
-    checkbox_section_keywords = [
-        "hereby apply for the following",
-        "tick one box only",
-        "please tick one box",
-        "please tick in the appropriate box",
-        "only one is allowed",
-        "due to:",
-        "reason for:",
-    ]
-    region_entities = []
-    for e in entities:
-        text = e.get("value", "").lower()
-        for keyword in checkbox_section_keywords:
-            if keyword in text:
-                region_entities.append(e)
-                logger.info(f"Found checkbox section header: '{e.get('value', '')}'")
-                break
-    if not region_entities:
-        for e in entities:
-            text = e.get("value", "").lower()
-            if "replacement copy" in text or "damage (" in text:
-                region_entities.append(e)
-                logger.info(f"Using checkbox option as anchor: '{e.get('value', '')}'")
-    if not region_entities:
-        logger.warning("No checkbox region found, using entire page")
+    """Find checkbox region with generous boundaries to include all checkboxes"""
+    if not entities:
+        logger.warning("No entities found, using entire page")
         return 0, 0, 10000, 10000
     
-    min_x = min(e.get("bbox", {}).get("x", 0) for e in region_entities)
-    max_x = max(e.get("bbox", {}).get("x", 0) + e.get("bbox", {}).get("width", 0)
-                for e in region_entities)
-    min_y = min(e.get("bbox", {}).get("y", 0) for e in region_entities)
-    max_y = max(e.get("bbox", {}).get("y", 0) + e.get("bbox", {}).get("height", 0)
-                for e in region_entities)
-    x_padding = 100
-    y_padding = 200
-    return (max(0, min_x - x_padding), max(0, min_y - y_padding),
-            max_x + x_padding, max_y + y_padding)
-
+    # Get overall document bounds
+    all_x1, all_y1, all_x2, all_y2 = [], [], [], []
+    for e in entities:
+        bbox = e.get("bbox", {})
+        x1 = bbox.get("x", 0)
+        y1 = bbox.get("y", 0)
+        x2 = x1 + bbox.get("width", 0)
+        y2 = y1 + bbox.get("height", 0)
+        
+        all_x1.append(x1)
+        all_y1.append(y1)
+        all_x2.append(x2)
+        all_y2.append(y2)
+    
+    if not all_x1:
+        logger.warning("No valid bounding boxes found")
+        return 0, 0, 10000, 10000
+    
+    # Find document boundaries
+    doc_left = min(all_x1)
+    doc_right = max(all_x2)
+    doc_top = min(all_y1)
+    doc_bottom = max(all_y2)
+    doc_width = doc_right - doc_left
+    doc_height = doc_bottom - doc_top
+    
+    logger.info(f"Document bounds: {doc_left}x{doc_top} to {doc_right}x{doc_bottom} ({doc_width}x{doc_height})")
+    
+    # Checkbox region: typically starts from middle to bottom of document
+    # Use very generous bounds to ensure we capture all checkboxes
+    region_left = max(0, doc_left - 100)  # Add 100px padding left
+    region_right = min(10000, doc_right + 100)  # Add 100px padding right
+    
+    # Vertical region: start from 40% of document height (not too high)
+    # to 90% of document height (not too low)
+    region_top = max(0, int(doc_top + (doc_height * 0.4)))
+    region_bottom = min(10000, int(doc_top + (doc_height * 0.9)))
+    
+    # If document is very small, adjust bounds
+    if doc_height < 500:
+        region_top = max(0, doc_top)
+        region_bottom = min(10000, doc_bottom)
+    
+    logger.info(f"Checkbox region (generous): {region_left}, {region_top}, {region_right}, {region_bottom}")
+    
+    # Now refine by looking for vertical clusters of text
+    # This helps when checkboxes are in the middle of the document
+    vertical_entities = []
+    for e in entities:
+        bbox = e.get("bbox", {})
+        y_center = bbox.get("y", 0) + (bbox.get("height", 0) / 2)
+        
+        # Check if entity is within our generous vertical bounds
+        if region_top <= y_center <= region_bottom:
+            vertical_entities.append(e)
+    
+    # If we found entities in the vertical region, adjust bounds to include them
+    if vertical_entities:
+        vert_y1 = min(e.get("bbox", {}).get("y", region_top) for e in vertical_entities)
+        vert_y2 = max(e.get("bbox", {}).get("y", 0) + e.get("bbox", {}).get("height", 0) 
+                     for e in vertical_entities)
+        
+        # Expand vertical bounds by 100px to be safe
+        region_top = max(0, vert_y1 - 100)
+        region_bottom = min(10000, vert_y2 + 100)
+        
+        # Also adjust horizontal bounds based on these entities
+        vert_x1 = min(e.get("bbox", {}).get("x", region_left) for e in vertical_entities)
+        vert_x2 = max(e.get("bbox", {}).get("x", 0) + e.get("bbox", {}).get("width", 0) 
+                     for e in vertical_entities)
+        
+        region_left = max(0, vert_x1 - 100)
+        region_right = min(10000, vert_x2 + 100)
+        
+        logger.info(f"Refined checkbox region: {region_left}, {region_top}, {region_right}, {region_bottom}")
+    
+    return (region_left, region_top, region_right, region_bottom)
+    
 def _is_in_region(entity: Dict, region: Tuple[int, int, int, int]) -> bool:
     """Check if entity is within the specified region"""
     if not region:
@@ -599,7 +647,59 @@ def merge_entities(entities: List[Dict]) -> List[Dict]:
     logger.info("=" * 80)
     logger.info("PHASE 1: Pre-merge phone extraction")
     logger.info("=" * 80)
+
+    # Check if entity looks like a checkbox option
+    def is_checkbox_candidate(entity: Dict) -> bool:
+        text = entity.get("value", "").lower()
+        checkbox_indicators = [
+            "due to:", "reason for:", "replacement", "damage", 
+            "certificate", "deletion", "facility", "loss"
+        ]
+        return any(indicator in text for indicator in checkbox_indicators)
     
+    by_page = defaultdict(list)
+    for e in entities:
+        by_page[e["page_number"]].append(e)
+    
+    merged = []
+    for page, page_entities in by_page.items():
+        page_entities.sort(key=lambda e: (e["bbox"]["y"], e["bbox"]["x"]))
+        
+        # Don't merge checkbox candidates at all
+        checkbox_candidates = [e for e in page_entities if is_checkbox_candidate(e)]
+        non_checkbox = [e for e in page_entities if not is_checkbox_candidate(e)]
+        
+        # Merge non-checkbox entities normally
+        current = None
+        for e in non_checkbox:
+            if current is None:
+                current = e.copy()
+                continue
+            
+            curr_bbox = current["bbox"]
+            e_bbox = e["bbox"]
+            y_diff = abs(e_bbox["y"] - curr_bbox["y"])
+            x_diff = e_bbox["x"] - (curr_bbox["x"] + curr_bbox["width"])
+            
+            # INCREASE THRESHOLDS
+            should_not_merge = (
+                y_diff >= 30 or  # Increased from 15
+                x_diff >= 100    # Increased from 50
+            )
+            
+            if should_not_merge:
+                merged.append(current)
+                current = e.copy()
+            else:
+                # Merge logic...
+                pass
+
+        if current:
+            merged.append(current)
+        
+        # Add checkbox candidates WITHOUT merging
+        merged.extend(checkbox_candidates)
+
     for e in entities:
         if "value" in e and e["value"]:
             e["value"] = e["value"].strip()
@@ -780,6 +880,121 @@ def clamp_bbox_to_image(bbox: Dict[str, Any], img_width: int, img_height: int) -
         "width": w,
         "height": h
     }
+        
+def load_fulltext_from_file(file_path: str) -> List[Dict[str, Any]]:
+    """
+    Read and return the complete content of a file.
+    
+    Args:
+        file_path (str): Path to the file to be read
+        
+    Returns:
+        str: Complete content of the file
+        
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        IOError: If there are issues reading the file
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+        return content
+    except UnicodeDecodeError:
+        # Fall back to system default encoding if utf-8 fails
+        with open(file_path, 'r') as file:
+            content = file.read()
+        return content
+
+import json
+import ast
+
+def scale_bbox_to_a4_300dpi(raw_bbox: Dict, document_width: int, document_height: int) -> Dict:
+    """
+    Scale bbox to target 2480x3509 (e.g. A4 at ~300 DPI).
+    raw_bbox uses keys: x, y, width, height (in pixels of original doc).
+    """
+    x = float(raw_bbox.get("x", 0))
+    y = float(raw_bbox.get("y", 0))
+    width = float(raw_bbox.get("width", 0))
+    height = float(raw_bbox.get("height", 0))
+
+    target_w = 2480
+    target_h = 3509
+
+    scale_x = target_w / max(1, document_width)
+    scale_y = target_h / max(1, document_height)
+
+    return {
+        "x": int(round(x * scale_x)),
+        "y": int(round(y * scale_y)),
+        "width": int(round(width * scale_x)),
+        "height": int(round(height * scale_y)),
+        "confidence": raw_bbox.get("confidence", 1.0),
+    }
+
+def parse_entities_from_literal(content: str, source_label: str = "<memory>") -> List[Dict[str, Any]]:
+    """
+    Same logic as load_entities_from_file, but works on a string
+    instead of reading from disk.
+    """
+    content = content.strip()
+    try:
+        data = ast.literal_eval(content)
+        if not isinstance(data, list):
+            raise ValueError("Content must be a list")
+        return data
+    except (ValueError, SyntaxError) as e:
+        raise ValueError(f"Invalid Python literal in {source_label}: {e}")
+
+def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict[str, Any]]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    associations = data.get("associations", [])
+    entities: List[Dict[str, Any]] = []
+
+    for idx, assoc in enumerate(associations, start=1):
+        page = assoc.get("page", 1)
+        text = assoc.get("text", "") or ""
+        bbox_list = assoc.get("bbox", [0, 0, 0, 0])
+        img_info = assoc.get("image_dimensions", {})  # from result1.json [file:43]
+        doc_w = int(img_info.get("width", 1))
+        doc_h = int(img_info.get("height", 1))
+
+        # bbox in result1.json is [x1, y1, x2, y2]
+        if len(bbox_list) == 4:
+            x1, y1, x2, y2 = bbox_list
+            raw_bbox = {
+                "x": float(x1),
+                "y": float(y1),
+                "width": float(x2 - x1),
+                "height": float(y2 - y1),
+                "confidence": 0.8,
+            }
+        else:
+            raw_bbox = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0, "confidence": 1.0}
+
+        # NEW: scale to 2480x3509
+        scaled = scale_bbox_to_a4_300dpi(raw_bbox, 1654, 2339)
+
+        entity = {
+            "field": f"word_{idx}",
+            "value": text,
+            "bbox": {
+                "x": scaled["x"],
+                "y": scaled["y"],
+                "width": scaled["width"],
+                "height": scaled["height"],
+            },
+            "confidence": scaled.get("confidence", 0.8),
+            "page_number": int(page),
+            "raw_text": text,
+            "ocr_method": "easyocr",
+        }
+        entities.append(entity)
+
+    literal_str = repr(entities)
+    return parse_entities_from_literal(literal_str, source_label="result1.json")
 
 def _extract_text_multipage(
     file_path: str, languages: str = "eng", conf_threshold: float = 0.15
@@ -791,356 +1006,708 @@ def _extract_text_multipage(
     images: List[Image.Image] = []
     clamped_count = 0
     validation_stats = {"total": 0, "valid": 0, "filtered": 0, "reasons": defaultdict(int)}
-
-    try:
-        if ext == ".pdf":
-            if not PDF2IMAGE_AVAILABLE:
-                raise RuntimeError("pdf2image not available")
-            poppler_path = os.environ.get("POPPLER_PATH")
-            kwargs = {"poppler_path": poppler_path} if poppler_path else {}
-            images = convert_from_path(file_path, dpi=300, **kwargs)
-        else:
-            img = Image.open(file_path).convert("RGB")
-            img = ImageOps.exif_transpose(img)
-            # Apply gentle enhancement - avoid over-processing
-            gray = img.convert("L")
-            # Use milder enhancement factors
-            enhanced = ImageEnhance.Contrast(gray).enhance(1.8)  # Reduced from 2.5
-            enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.5)  # Reduced from 2.0
-            # Skip median filter for now - it can blur text positions
-            images = [enhanced]
-    except Exception as e:
-        logger.exception("Failed to convert file to images: %s", e)
-        return [], "", 0, []
-
-    global_idx = 0
-    logger.info("STARTING OCR EXTRACTION")
-
-    if EASYOCR_AVAILABLE:
-        try:
-            gpu_available = CUDA_AVAILABLE and torch.cuda.is_available()
-            langs = ["ch_sim", "en"] if "chi_sim" in languages else ["en"]
-            reader = easyocr.Reader(langs, gpu=gpu_available, verbose=False, detector=True)
-
-            for page_idx, img in enumerate(images):
-                page_num = page_idx + 1
-                img_width, img_height = img.size
-                logger.info(f"Processing page {page_num} ({img_width}x{img_height}) with EasyOCR...")
-
-                try:
-                    # Get both word-level and paragraph-level results for redundancy
-                    word_results = reader.readtext(
-                        np.array(img), detail=1, paragraph=False, min_size=5, contrast_ths=0.1
-                    )
-                    
-                    # Add paragraph results for context (optional)
-                    para_results = reader.readtext(
-                        np.array(img), detail=1, paragraph=True, min_size=15, contrast_ths=0.1
-                    )
-                    
-                    all_results = word_results + para_results
-
-                    for res_idx, res in enumerate(all_results):
-                        try:
-                            if len(res) == 3:  # (bbox, text, confidence)
-                                bbox, text, conf = res
-                            elif len(res) == 2:  # (bbox, text)
-                                bbox, text = res
-                                conf = 0.8
-                            else:
-                                continue
-                        except Exception as e:
-                            logger.warning(f"Result parsing failed: {e}")
-                            continue
-
-                        if conf < conf_threshold:
-                            continue
-                        if not text.strip():
-                            continue
-
-                        # ✅ ROBUST BBOX CALCULATION - FIXED VERSION
-                        try:
-                            # Convert polygon coordinates to proper rectangle
-                            polygon = [(float(p[0]), float(p[1])) for p in bbox]
-                            
-                            # Get min/max coordinates from polygon
-                            xs = [p[0] for p in polygon]
-                            ys = [p[1] for p in polygon]
-                            
-                            left = max(0, min(xs))
-                            top = max(0, min(ys))
-                            right = min(img_width - 1, max(xs))
-                            bottom = min(img_height - 1, max(ys))
-                            
-                            # Ensure valid rectangle
-                            if right <= left:
-                                right = left + 1
-                            if bottom <= top:
-                                bottom = top + 1
-                            
-                            min_x = int(round(left))
-                            min_y = int(round(top))
-                            bbox_width = int(round(right - left))
-                            bbox_height = int(round(bottom - top))
-                            
-                            # Final validation and clamping
-                            if bbox_width <= 0 or bbox_height <= 0:
-                                logger.debug(f"Invalid bbox dimensions: {bbox_width}x{bbox_height}, skipping")
-                                continue
-                            
-                            # Clamp to reasonable heights
-                            MAX_HEIGHT = 100  # Reasonable max height for text
-                            if bbox_height > MAX_HEIGHT:
-                                bbox_height = MAX_HEIGHT
-                                bottom = top + bbox_height
-                                clamped_count += 1
-                            
-                            # Validate coordinates are within image bounds
-                            min_x = max(0, min(min_x, img_width - 1))
-                            min_y = max(0, min(min_y, img_height - 1))
-                            bbox_width = max(1, min(bbox_width, img_width - min_x))
-                            bbox_height = max(1, min(bbox_height, img_height - min_y))
-
-                        except Exception as e:
-                            logger.warning(f"BBox calculation failed for text '{text}': {e}")
-                            continue
-
-                        cleaned = _clean_word(text, language_code=languages.split("+")[0])
-                        if not cleaned:
-                            continue
-                            
-                        if "✓" in cleaned:
-                            logger.warning(f"Found checkmark: '{text}' -> '{cleaned}'")
-                            cleaned = cleaned.replace("✓", "").strip()
-
-                        entities.append({
-                            "field": f"word_{global_idx+1}",
-                            "value": cleaned,
-                            "bbox": {
-                                "x": min_x,
-                                "y": min_y,
-                                "width": bbox_width,
-                                "height": bbox_height
-                            },
-                            "confidence": float(conf),
-                            "page_number": page_num,
-                            "raw_text": text,
-                            "ocr_method": "easyocr",
-                        })
-                        full_text_parts.append(cleaned)
-                        global_idx += 1
-                        
-                        # Debug logging for large bboxes
-                        if bbox_height > 80:
-                            logger.debug(f"Large bbox detected: {bbox_height}px - '{text}' at ({min_x},{min_y})")
-                            
-                except Exception as e:
-                    logger.warning(f"EasyOCR failed for page {page_num}: {e}")
-                    continue
-        except Exception as e:
-            logger.warning(f"EasyOCR initialization failed: {e}")
-
-    # Fallback to Tesseract with PROPER bbox validation
-    if (not entities or len(entities) < 5) and TESSERACT_AVAILABLE:
-        logger.info("Falling back to Tesseract with proper bbox validation")
-        
-        for page_idx, img in enumerate(images):
-            page_num = page_idx + 1
-            try:
-                # Use Tesseract with better config
-                ocr_data = pytesseract.image_to_data(
-                    img, 
-                    output_type=pytesseract.Output.DICT,
-                    config='--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.,:;!?()[]{}-_$#@%&*+=/\\"\'\\s'
-                )
-                
-                for i in range(len(ocr_data['text'])):
-                    text = ocr_data['text'][i].strip()
-                    conf = float(ocr_data['conf'][i]) if ocr_data['conf'][i] != '-1' else 0.0
-                    
-                    if not text or conf < conf_threshold * 100:  # Tesseract uses 0-100 scale
-                        continue
-                    
-                    x = ocr_data['left'][i]
-                    y = ocr_data['top'][i]
-                    w = ocr_data['width'][i]
-                    h = ocr_data['height'][i]
-                    
-                    # Validate and clamp coordinates
-                    img_width, img_height = img.size
-                    x = max(0, min(x, img_width - 1))
-                    y = max(0, min(y, img_height - 1))
-                    w = max(1, min(w, img_width - x))
-                    h = max(1, min(h, img_height - y))
-                    
-                    # Clamp height
-                    MAX_HEIGHT = 100
-                    if h > MAX_HEIGHT:
-                        h = MAX_HEIGHT
-                        clamped_count += 1
-                    
-                    cleaned = _clean_word(text, language_code=languages.split("+")[0])
-                    if not cleaned:
-                        continue
-                    
-                    entities.append({
-                        "field": f"tess_{global_idx+1}",
-                        "value": cleaned,
-                        "bbox": {"x": x, "y": y, "width": w, "height": h},
-                        "confidence": conf / 100.0,  # Normalize to 0-1
-                        "page_number": page_num,
-                        "ocr_method": "tesseract"
-                    })
-                    full_text_parts.append(cleaned)
-                    global_idx += 1
-                    
-            except Exception as e:
-                logger.warning(f"Tesseract failed for page {page_num}: {e}")
-
-    logger.info(f"Total entities BEFORE merge: {len(entities)}")
+   
+    # Load entities from result.json
+    entities = convert_result_json_to_test_page_data_in_memory("result1.json")
     
-    # ✅ ROBUST SPATIAL VALIDATION BEFORE MERGING
-    if entities:
-        # Get image dimensions for validation
-        img_width, img_height = images[0].size if images else (1654, 2339)
-        
-        # First pass: validate and clamp bboxes
-        validated_entities = []
-        for e in entities:
-            bbox = e.get("bbox", {})
-            validation_stats["total"] += 1
-            
-            # Validate bbox
-            is_valid, reason = is_valid_bbox(bbox, img_width, img_height)
-            
-            if is_valid:
-                validation_stats["valid"] += 1
-                validated_entities.append(e)
-            else:
-                validation_stats["filtered"] += 1
-                validation_stats["reasons"][reason] += 1
-                logger.debug(f"Filtered entity '{e.get('value', '')}' - {reason}")
-                
-                # Try to recover by clamping
-                clamped_bbox = clamp_bbox_to_image(bbox, img_width, img_height)
-                # Check if clamped bbox is valid now
-                is_valid_after_clamp, _ = is_valid_bbox(clamped_bbox, img_width, img_height)
-                if is_valid_after_clamp:
-                    e_clamped = e.copy()
-                    e_clamped["bbox"] = clamped_bbox
-                    validated_entities.append(e_clamped)
-                    logger.debug(f"Recovered entity by clamping: '{e.get('value', '')}'")
-        
-        # Log validation statistics
-        if validation_stats["filtered"] > 0:
-            logger.info(f"Entity validation results: {validation_stats['valid']}/{validation_stats['total']} valid, {validation_stats['filtered']} filtered")
-            for reason, count in validation_stats["reasons"].items():
-                logger.info(f"  - {count} entities filtered due to: {reason}")
-        
-        # Only proceed with validated entities
-        if validated_entities:
-            entities = validated_entities
-            entities = merge_entities(entities)
-        else:
-            logger.warning("No valid entities after validation, keeping original entities")
-            entities = merge_entities(entities)
-    
-    full_text = " ".join(full_text_parts)
-    logger.info(f"Final count AFTER merge: {len(entities)}, {clamped_count} bboxes clamped")
-    
-    return entities, full_text, len(images), images
+    return entities, len(images), images
 
 # ------- LiLT Relation Extractor -------
 class LiLTRelationExtractor:
     def __init__(self, model_path: str, config: LiLTConfig, device: Optional[int] = None):
         self.model_path = model_path
         self.config = config
-        self.device = device if device is not None else (
-            0 if (TORCH_AVAILABLE and torch.cuda.is_available()) else -1
-        )
+        self.device = device if device is not None else (0 if (TORCH_AVAILABLE and torch.cuda.is_available()) else -1)
+        # Add device_str for moving tensors
+        self.device_str = f"cuda:{self.device}" if self.device >= 0 else "cpu"
         self.available = False
+        self.tokenizer = None
+        self.model = None
+        
         if not (LILT_AVAILABLE and TORCH_AVAILABLE):
             logger.warning("LiLT model or torch not available")
             return
+
         try:
             logger.info(f"Loading LiLT from: {model_path}")
+            
+            # Fix: Load tokenizer with Mistral regex fix disabled
             try:
-                encoder = AutoModel.from_pretrained(model_path)
-                logger.info("Loaded encoder from model path")
-            except Exception as e1:
-                logger.warning(f"Failed to load encoder from model path: {e1}")
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    use_fast=True,
+                    fix_mistral_regex=False  # Explicitly disable for non-Mistral models
+                )
+                logger.info(f"Loaded tokenizer: {type(self.tokenizer).__name__}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to load tokenizer from {model_path}: {e}")
+                # Fallback to a default tokenizer
                 try:
-                    encoder = AutoModel.from_pretrained("SCUT-DLVCLab/lilt-roberta-en-base")
-                    logger.info("Loaded default LiLT encoder")
-                except Exception as e2:
-                    logger.warning(f"Failed to load default encoder: {e2}")
-                    encoder_config = AutoConfig.from_pretrained("roberta-base")
-                    encoder = AutoModel.from_config(encoder_config)
-                    logger.info("Created encoder from config")
-            self.model = LiLTRobertaLikeForRelationExtraction(
-                encoder=encoder, num_rel_labels=config.num_rel_labels
-            )
-            logger.info(f"Created LiLT model with num_rel_labels={config.num_rel_labels}")
-            model_file = self._find_model_file(model_path)
-            if model_file:
-                logger.info(f"Attempting to load LiLT weights from: {model_file}")
-                try:
-                    state_obj = torch.load(model_file, map_location="cpu", weights_only=False)
-                    if isinstance(state_obj, dict) and all(
-                        isinstance(k, str) for k in state_obj.keys()
-                    ):
-                        if "state_dict" in state_obj:
-                            state_dict = state_obj["state_dict"]
-                        elif "model" in state_obj and isinstance(state_obj["model"], dict):
-                            state_dict = state_obj["model"]
-                        else:
-                            state_dict = state_obj
-                        model_dict = self.model.state_dict()
-                        filtered = {
-                            k: v
-                            for k, v in state_dict.items()
-                            if k in model_dict and hasattr(v, "shape")
-                            and v.shape == model_dict[k].shape
-                        }
-                        self.model.load_state_dict(filtered, strict=False)
-                        logger.info(f"Loaded {len(filtered)} LiLT weights")
-                    else:
-                        logger.warning(
-                            "Checkpoint does not look like a plain state_dict; skipping head loading."
-                        )
-                except (pickle.UnpicklingError, RuntimeError, EOFError) as e:
-                    logger.warning(
-                        f"LiLT checkpoint at '{model_file}' is not a valid torch state_dict; "
-                        f"using randomly initialized head. Error: {e}"
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        "roberta-base",
+                        use_fast=True
                     )
+                    logger.info("Loaded fallback RoBERTa base tokenizer")
+                except Exception as e2:
+                    logger.error(f"Failed to load fallback tokenizer: {e2}")
+                    self.tokenizer = None
+            
+            # FIXED: Simplified and robust model loading
+            try:
+                # Strategy 1: Try to create a simple model from config
+                try:
+                    # Load config first
+                    config_model = AutoConfig.from_pretrained(
+                        model_path,
+                        trust_remote_code=True
+                    )
+                    
+                    # Set the number of relation labels
+                    config_model.num_labels = config.num_rel_labels
+                    
+                    # Create base model from config
+                    base_model = AutoModel.from_config(config_model)
+                    
+                    # Create custom relation extraction model
+                    self.model = LiLTRobertaLikeForRelationExtraction(
+                        encoder=base_model,
+                        num_rel_labels=config.num_rel_labels
+                    )
+                    
+                    logger.info("Created LiLT model from config (random weights)")
+                    
                 except Exception as e:
-                    logger.warning(f"Unexpected error while loading LiLT weights: {e}")
+                    logger.warning(f"Failed to create model from config: {e}")
+                    
+                    # Strategy 2: Try direct loading with error handling
+                    try:
+                        self.model = AutoModel.from_pretrained(
+                            model_path,
+                            trust_remote_code=True
+                        )
+                        logger.info("Directly loaded LiLT model with AutoModel")
+                    except Exception as e2:
+                        logger.error(f"All model loading attempts failed: {e2}")
+                        self.model = None
+                
+                # Try to load weights if model was created
+                if self.model:
+                    # Try to find and load weights
+                    weights_loaded = self._try_load_weights(model_path)
+                    
+                    if not weights_loaded:
+                        logger.warning("Model created with random weights - will need fine-tuning")
+                
+            except Exception as config_error:
+                logger.error(f"Failed to initialize model: {config_error}")
+                self.model = None
+            
+            # Move model to device
+            if self.model:
+                self.model = self.model.to(self.device_str)
+                self.model.eval()
+                self.available = True
+                logger.info(f"LiLT model ready on {self.device_str}")
+                logger.info("Note: Random initialization is normal if no weights were found")
             else:
-                logger.info("No LiLT head weights file found; using initialized model")
-            device_name = f"cuda:{self.device}" if self.device >= 0 else "cpu"
-            self.model = self.model.to(device_name)
-            self.model.eval()
-            self.available = True
-            logger.info(f"LiLT model ready on {device_name}")
+                logger.warning("LiLT model not loaded")
+                
         except Exception as e:
             logger.error(f"Failed to initialize LiLT model: {e}")
+            logger.exception(e)
             self.available = False
+    
+    def _try_load_weights(self, model_path: str) -> bool:
+        """Try to load weights with multiple strategies"""
+        model_file = self._find_model_file(model_path)
+        if not model_file:
+            logger.info("No model file found, using random initialization")
+            return False
+        
+        logger.info(f"Found potential model file: {model_file}")
+        
+        try:
+            # Check if it's a safetensors file
+            if model_file.endswith('.safetensors'):
+                try:
+                    from safetensors.torch import load_file
+                    state_dict = load_file(model_file, device="cpu")
+                    logger.info(f"Loaded safetensors file: {len(state_dict)} keys")
+                except ImportError:
+                    logger.error("safetensors not installed. Install with: pip install safetensors")
+                    return False
+                except Exception as e:
+                    logger.error(f"Failed to load safetensors: {e}")
+                    return False
+            else:
+                # Try loading with different approaches
+                try:
+                    # First try with weights_only=True (safer)
+                    state_dict = torch.load(model_file, map_location="cpu", weights_only=True)
+                    logger.info("Loaded weights with weights_only=True")
+                except Exception:
+                    try:
+                        # Try with weights_only=False if safe
+                        state_dict = torch.load(model_file, map_location="cpu", weights_only=False)
+                        logger.info("Loaded weights with weights_only=False")
+                    except Exception as e:
+                        logger.error(f"Failed to load weights file: {e}")
+                        # Check if file might be corrupted
+                        file_size = os.path.getsize(model_file)
+                        logger.info(f"Model file size: {file_size:,} bytes")
+                        if file_size < 1024:
+                            logger.warning("Model file is too small, likely corrupted")
+                        return False
+            
+            # Process state_dict
+            if isinstance(state_dict, dict):
+                # Handle different state_dict formats
+                if "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+                elif "model" in state_dict:
+                    state_dict = state_dict["model"]
+                elif "model_state_dict" in state_dict:
+                    state_dict = state_dict["model_state_dict"]
+                
+                # Load into model
+                try:
+                    self.model.load_state_dict(state_dict, strict=False)
+                    logger.info(f"Successfully loaded weights into model")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Could not load state_dict directly: {e}")
+                    
+                    # Try partial loading
+                    try:
+                        model_dict = self.model.state_dict()
+                        filtered_dict = {k: v for k, v in state_dict.items() 
+                                       if k in model_dict and v.shape == model_dict[k].shape}
+                        
+                        if filtered_dict:
+                            model_dict.update(filtered_dict)
+                            self.model.load_state_dict(model_dict)
+                            logger.info(f"Partially loaded {len(filtered_dict)}/{len(model_dict)} weights")
+                            return True
+                    except Exception as e2:
+                        logger.warning(f"Partial loading failed: {e2}")
+            
+            return False
+                
+        except Exception as e:
+            logger.error(f"Error loading weights: {e}")
+            return False
+    
     def _find_model_file(self, model_path: str) -> Optional[str]:
-        candidate_files = [
-            "re_head.pt",
-            "re_head.bin",
+        """Find model file in directory"""
+        # Check if it's already a file
+        if os.path.isfile(model_path):
+            return model_path
+        
+        # Check for common model files
+        common_files = [
             "pytorch_model.bin",
-            "model.pt",
             "model.bin",
+            "model.safetensors",
+            "pytorch_model.pt",
+            "model.pt",
+            "checkpoint.pt",
+            "weights.pt",
         ]
-        for fname in candidate_files:
+        
+        for fname in common_files:
             path = os.path.join(model_path, fname)
-            if os.path.isfile(path) and os.path.getsize(path) > 1024:
-                logger.info(
-                    f"Found candidate LiLT checkpoint: {path} (size={os.path.getsize(path)})"
-                )
+            if os.path.isfile(path):
                 return path
+        
+        # Search for any model file
+        try:
+            for root, _, files in os.walk(model_path):
+                for f in files:
+                    if f.endswith(('.bin', '.pt', '.safetensors')):
+                        path = os.path.join(root, f)
+                        file_size = os.path.getsize(path)
+                        if file_size > 1024:  # At least 1KB
+                            return path
+        except:
+            pass
+        
         return None
+
+    def _create_memory_efficient_inputs(self, words: List[str], bboxes: List[List[int]], max_seq_length: int = 512) -> Optional[Dict]:
+        """Create inputs with memory-efficient chunking"""
+        try:
+            # Use a smaller batch size for memory efficiency
+            chunk_size = 32  # Reduced from potentially 512
+            
+            # Process in chunks if too many entities
+            if len(words) > chunk_size:
+                logger.info(f"Processing {len(words)} entities in chunks of {chunk_size} for memory efficiency")
+                return self._process_in_chunks(words, bboxes, chunk_size, max_seq_length)
+            
+            # For small number of entities, use regular processing
+            if hasattr(self.tokenizer, "encode_plus_with_bbox"):
+                encoded = self.tokenizer.encode_plus_with_bbox(
+                    words,
+                    bboxes,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_seq_length,
+                    return_tensors="pt"
+                )
+            else:
+                try:
+                    encoded = self.tokenizer(
+                        words,
+                        boxes=bboxes,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_seq_length,
+                        return_tensors="pt"
+                    )
+                except TypeError:
+                    # Fallback to text-only
+                    encoded = self.tokenizer(
+                        words,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_seq_length,
+                        return_tensors="pt"
+                    )
+            
+            # Move to device
+            encoded = {k: v.to(self.device_str) for k, v in encoded.items()}
+            return encoded
+            
+        except Exception as e:
+            logger.error(f"Error in memory-efficient inputs: {e}")
+            return None
+    
+    def _process_in_chunks(self, words: List[str], bboxes: List[List[int]], chunk_size: int, max_seq_length: int) -> Optional[Dict]:
+        """Process large number of entities in chunks to save memory"""
+        all_chunks = []
+        
+        for i in range(0, len(words), chunk_size):
+            chunk_words = words[i:i+chunk_size]
+            chunk_bboxes = bboxes[i:i+chunk_size]
+            
+            if hasattr(self.tokenizer, "encode_plus_with_bbox"):
+                chunk_encoded = self.tokenizer.encode_plus_with_bbox(
+                    chunk_words,
+                    chunk_bboxes,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_seq_length,
+                    return_tensors="pt"
+                )
+            else:
+                try:
+                    chunk_encoded = self.tokenizer(
+                        chunk_words,
+                        boxes=chunk_bboxes,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_seq_length,
+                        return_tensors="pt"
+                    )
+                except TypeError:
+                    # Fallback to text-only
+                    chunk_encoded = self.tokenizer(
+                        chunk_words,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_seq_length,
+                        return_tensors="pt"
+                    )
+            
+            all_chunks.append(chunk_encoded)
+        
+        if not all_chunks:
+            return None
+        
+        # Use first chunk as base (we'll just process chunks sequentially in the main extraction)
+        first_chunk = all_chunks[0]
+        first_chunk = {k: v.to(self.device_str) for k, v in first_chunk.items()}
+        return first_chunk
+    
+    def _extract_relations_memory_efficient(self, entities: List[Dict], max_entities_per_batch: int = 50) -> List[Dict]:
+        """Extract relations with memory limits"""
+        if not self.available or not entities:
+            return []
+        
+        try:
+            # Group by page
+            pages = {}
+            for entity in entities:
+                page_num = entity.get("page_number", 1)
+                if page_num not in pages:
+                    pages[page_num] = []
+                pages[page_num].append(entity)
+            
+            all_relations = []
+            
+            for page_num, page_entities in pages.items():
+                if not page_entities or len(page_entities) < 2:
+                    continue
+                
+                # If too many entities, sample or filter
+                if len(page_entities) > max_entities_per_batch:
+                    logger.info(f"Page {page_num} has {len(page_entities)} entities, limiting to {max_entities_per_batch}")
+                    # Sample entities with highest confidence
+                    page_entities = sorted(page_entities, key=lambda x: x.get("confidence", 0), reverse=True)[:max_entities_per_batch]
+                
+                words = [e["value"] for e in page_entities]
+                bboxes = [e["bbox"] for e in page_entities]
+                
+                # Normalize bboxes
+                normalized_bboxes = []
+                for bbox in bboxes:
+                    x = bbox.get("x", 0)
+                    y = bbox.get("y", 0)
+                    width = bbox.get("width", 0)
+                    height = bbox.get("height", 0)
+                    
+                    x2 = x + width
+                    y2 = y + height
+                    
+                    # Simple normalization to 0-1000
+                    max_coord = 1000
+                    norm_x = min(int((x / max(x2, 1)) * max_coord), 999)
+                    norm_y = min(int((y / max(y2, 1)) * max_coord), 999)
+                    norm_x2 = min(int((x2 / max(x2, 1)) * max_coord), 1000)
+                    norm_y2 = min(int((y2 / max(y2, 1)) * max_coord), 1000)
+                    
+                    normalized_bboxes.append([norm_x, norm_y, norm_x2, norm_y2])
+                
+                # Get inputs with memory limits
+                inputs = self._create_memory_efficient_inputs(words, normalized_bboxes, max_seq_length=256)
+                
+                if inputs is None:
+                    logger.warning(f"Failed to create inputs for page {page_num}")
+                    # Use fallback spatial relations
+                    fallback_relations = self._extract_spatial_relations(page_entities, words, normalized_bboxes)
+                    all_relations.extend(fallback_relations)
+                    continue
+                
+                try:
+                    # Run with torch.no_grad and reduced precision if needed
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                    
+                    # Process outputs with better error handling
+                    try:
+                        relations = self._process_model_outputs(outputs, page_entities, words, normalized_bboxes)
+                    except Exception as e:
+                        logger.error(f"Error processing model outputs: {e}")
+                        # Use fallback spatial relations
+                        relations = self._extract_spatial_relations(page_entities, words, normalized_bboxes)
+                    
+                    all_relations.extend(relations)
+                    
+                except torch.cuda.OutOfMemoryError:
+                    logger.error(f"Out of memory processing page {page_num}, using fallback spatial relations")
+                    # Clear cache and use fallback
+                    torch.cuda.empty_cache()
+                    fallback_relations = self._extract_spatial_relations(page_entities, words, normalized_bboxes)
+                    all_relations.extend(fallback_relations)
+                
+                except Exception as e:
+                    logger.error(f"Error processing page {page_num}: {e}")
+                    # Use fallback
+                    fallback_relations = self._extract_spatial_relations(page_entities, words, normalized_bboxes)
+                    all_relations.extend(fallback_relations)
+            
+            logger.info(f"Extracted {len(all_relations)} relations (memory-efficient)")
+            return all_relations
+        
+        except Exception as e:
+            logger.error(f"Error in memory-efficient extraction: {e}")
+            torch.cuda.empty_cache()
+            return []
+    
+    def _extract_spatial_relations(self, entities: List[Dict], words: List[str], bboxes: List[List[int]]) -> List[Dict]:
+        """Extract spatial relations as fallback when model fails"""
+        relations = []
+        
+        if len(entities) < 2:
+            return relations
+        
+        # Use spatial proximity to find potential label-value pairs
+        for i in range(len(entities)):
+            for j in range(len(entities)):
+                if i == j:
+                    continue
+                
+                # Check if these entities might form a label-value pair
+                entity_i = entities[i]
+                entity_j = entities[j]
+                
+                # Check confidence
+                if entity_i.get("confidence", 0) < 0.3 or entity_j.get("confidence", 0) < 0.3:
+                    continue
+                
+                # Check spatial relationship
+                bbox_i = bboxes[i]
+                bbox_j = bboxes[j]
+                
+                # Calculate distance and alignment
+                y_diff = abs((bbox_i[1] + bbox_i[3])/2 - (bbox_j[1] + bbox_j[3])/2)
+                x_diff = bbox_j[0] - bbox_i[2]  # Distance from end of i to start of j
+                
+                # Heuristic: label is often to the left of value on same line
+                if x_diff > 0 and x_diff < 200 and y_diff < 30:
+                    distance = sqrt((bbox_i[0] - bbox_j[0])**2 + (bbox_i[1] - bbox_j[1])**2)
+                    
+                    relation = {
+                        "label_entity": entity_i,
+                        "value_entity": entity_j,
+                        "label_text": words[i],
+                        "value_text": words[j],
+                        "label_bbox": bboxes[i],
+                        "value_bbox": bboxes[j],
+                        "score": 0.7,  # Heuristic confidence
+                        "distance": distance,
+                        "page_number": entity_i.get("page_number", 1),
+                        "method": "spatial_fallback"
+                    }
+                    relations.append(relation)
+        
+        return relations
+
+    def extract_relations(self, entities: List[Dict]) -> List[Dict]:
+        """Extract relations between entities with memory limits"""
+        if not self.available or not entities:
+            logger.warning("LiLT model not available or no entities provided")
+            return []
+        
+        # Set memory limits
+        max_entities_total = 100  # Maximum total entities to process
+        max_entities_per_page = 50  # Maximum entities per page
+        
+        if len(entities) > max_entities_total:
+            logger.warning(f"Too many entities ({len(entities)}), limiting to {max_entities_total}")
+            # Sort by confidence and take top N
+            entities = sorted(entities, key=lambda x: x.get("confidence", 0), reverse=True)[:max_entities_total]
+        
+        # Try memory-efficient extraction first
+        relations = self._extract_relations_memory_efficient(entities, max_entities_per_page)
+        
+        if not relations:
+            # Fallback to spatial relations only
+            logger.info("Using spatial fallback relations only")
+            relations = self._extract_fallback_relations(entities)
+        
+        # Clear GPU cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return relations
+    
+    def _extract_fallback_relations(self, entities: List[Dict]) -> List[Dict]:
+        """Simple fallback relation extraction based on spatial proximity"""
+        relations = []
+        
+        # Group by page
+        pages = {}
+        for entity in entities:
+            page_num = entity.get("page_number", 1)
+            if page_num not in pages:
+                pages[page_num] = []
+            pages[page_num].append(entity)
+        
+        for page_num, page_entities in pages.items():
+            if len(page_entities) < 2:
+                continue
+            
+            # Sort by position (top-left to bottom-right)
+            page_entities.sort(key=lambda e: (e.get("bbox", {}).get("y", 0), e.get("bbox", {}).get("x", 0)))
+            
+            # Create pairwise relations for adjacent entities
+            for i in range(len(page_entities) - 1):
+                e1 = page_entities[i]
+                e2 = page_entities[i + 1]
+                
+                bbox1 = e1.get("bbox", {})
+                bbox2 = e2.get("bbox", {})
+                
+                x1, y1 = bbox1.get("x", 0), bbox1.get("y", 0)
+                x2, y2 = bbox2.get("x", 0), bbox2.get("y", 0)
+                
+                # Calculate distance
+                distance = sqrt((x1 - x2)**2 + (y1 - y2)**2)
+                
+                # Only create relation if reasonably close
+                if distance < 300:  # 300 pixels threshold
+                    relation = {
+                        "label_entity": e1,
+                        "value_entity": e2,
+                        "label_text": e1.get("value", ""),
+                        "value_text": e2.get("value", ""),
+                        "label_bbox": [x1, y1, x1 + bbox1.get("width", 0), y1 + bbox1.get("height", 0)],
+                        "value_bbox": [x2, y2, x2 + bbox2.get("width", 0), y2 + bbox2.get("height", 0)],
+                        "score": max(0.1, 1.0 - distance/300),  # Higher score for closer entities
+                        "distance": distance,
+                        "page_number": page_num,
+                        "method": "spatial_adjacency"
+                    }
+                    relations.append(relation)
+        
+        return relations
+
+    def _tokenize_with_layout(self, words: List[str], bboxes: List[List[int]]) -> Optional[Dict]:
+        """Tokenize text with layout information using the appropriate method"""
+        try:
+            # First, get tokenized inputs
+            if hasattr(self.tokenizer, "encode_plus_with_bbox"):
+                # Some layout tokenizers have this method
+                encoded = self.tokenizer.encode_plus_with_bbox(
+                    words,
+                    bboxes,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                )
+                # Move to device
+                encoded = {k: v.to(self.device_str) for k, v in encoded.items()}
+                return encoded
+            
+            # Try standard tokenization with bbox parameter
+            try:
+                inputs = self.tokenizer(
+                    words,
+                    boxes=bboxes,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(self.device_str) for k, v in inputs.items()}
+                return inputs
+            except TypeError:
+                # Fallback: manually process layout information
+                logger.warning("Tokenizer doesn't support boxes parameter, using text-only mode")
+                inputs = self.tokenizer(
+                    words,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(self.device_str) for k, v in inputs.items()}
+                
+                # Add bbox information to inputs manually if model expects it
+                if hasattr(self.model, "config") and hasattr(self.model.config, "use_bbox"):
+                    bbox_tensor = torch.tensor(bboxes, dtype=torch.long)
+                    bbox_tensor = bbox_tensor.to(self.device_str)
+                    inputs["bbox"] = bbox_tensor
+                
+                return inputs
+        
+        except Exception as e:
+            logger.error(f"Error during layout-aware tokenization: {e}")
+            return None
+
+    def _process_model_outputs(self, outputs, entities, words, bboxes) -> List[Dict]:
+        """Process model outputs to extract relations between entities"""
+        relations = []
+        
+        # Check if outputs contain relation predictions
+        if hasattr(outputs, 'logits') and outputs.logits is not None:
+            logits = outputs.logits
+            
+            # Handle different logits shapes
+            if logits.dim() == 3:  # [batch_size, sequence_length, num_labels]
+                # This is token classification output, not relation extraction
+                # Use fallback spatial relations instead
+                logger.warning("Model returned token classification logits, using spatial fallback")
+                return self._extract_spatial_relations(entities, words, bboxes)
+            
+            elif logits.dim() == 2:  # [batch_size, num_relations]
+                # This looks like relation extraction output
+                try:
+                    # Get scores for positive relations (assuming binary classification)
+                    if logits.shape[1] >= 2:  # Has at least 2 classes
+                        relation_probs = torch.softmax(logits, dim=-1)
+                        positive_scores = relation_probs[:, 1]  # Probability for positive relation
+                        
+                        # Create potential relations
+                        # This assumes the model outputs relations for all entity pairs
+                        n_entities = len(entities)
+                        expected_relations = n_entities * (n_entities - 1)  # All possible non-self relations
+                        
+                        if len(positive_scores) >= expected_relations:
+                            idx = 0
+                            for i in range(n_entities):
+                                for j in range(n_entities):
+                                    if i == j:
+                                        continue
+                                        
+                                    if idx < len(positive_scores):
+                                        score = positive_scores[idx].item()
+                                        if score > self.config.min_confidence:
+                                            relations.append({
+                                                "label_entity": entities[i],
+                                                "value_entity": entities[j],
+                                                "label_text": words[i],
+                                                "value_text": words[j],
+                                                "label_bbox": bboxes[i],
+                                                "value_bbox": bboxes[j],
+                                                "score": score,
+                                                "distance": self._calculate_distance(bboxes[i], bboxes[j]),
+                                                "page_number": entities[i].get("page_number", 1)
+                                            })
+                                        idx += 1
+                    else:
+                        # Single class output - use thresholding
+                        relation_scores = torch.sigmoid(logits).squeeze()
+                        if relation_scores.dim() == 0:
+                            relation_scores = relation_scores.unsqueeze(0)
+                        
+                        # Create potential relations based on score threshold
+                        n_entities = len(entities)
+                        for i in range(min(n_entities, 10)):  # Limit for performance
+                            for j in range(min(n_entities, 10)):
+                                if i == j or i >= j:  # Only create one direction to avoid duplicates
+                                    continue
+                                    
+                                # Create relation based on spatial proximity
+                                distance = self._calculate_distance(bboxes[i], bboxes[j])
+                                if distance < 200:  # Close entities
+                                    relations.append({
+                                        "label_entity": entities[i],
+                                        "value_entity": entities[j],
+                                        "label_text": words[i],
+                                        "value_text": words[j],
+                                        "label_bbox": bboxes[i],
+                                        "value_bbox": bboxes[j],
+                                        "score": 0.7,  # Heuristic confidence
+                                        "distance": distance,
+                                        "page_number": entities[i].get("page_number", 1)
+                                    })
+                                    
+                except Exception as e:
+                    logger.error(f"Error processing relation logits: {e}")
+                    # Fallback to spatial relations
+                    return self._extract_spatial_relations(entities, words, bboxes)
+        
+        # Fallback: if no explicit relations, use spatial proximity
+        if not relations:
+            logger.info("No explicit relations found, using spatial proximity as fallback")
+            relations = self._extract_spatial_relations(entities, words, bboxes)
+        
+        return relations
+    
+    def _calculate_distance(self, bbox1, bbox2):
+        """Calculate distance between two bounding boxes"""
+        x1_center = (bbox1[0] + bbox1[2]) / 2
+        y1_center = (bbox1[1] + bbox1[3]) / 2
+        x2_center = (bbox2[0] + bbox2[2]) / 2
+        y2_center = (bbox2[1] + bbox2[3]) / 2
+        
+        return ((x1_center - x2_center) ** 2 + (y1_center - y2_center) ** 2) ** 0.5
+    
     def is_available(self) -> bool:
         return self.available
 
@@ -1386,24 +1953,6 @@ class FormFieldDetector:
             return False
         t = text.lower()
         return any(k in t for k in ["phone", "tel", "telephone", "contact", "電話", "手机", "聯絡", "铬", "?l"])
-    def _extract_email(self, text: str) -> Optional[str]:
-        if not text:
-            return None
-        patterns = [
-            r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
-            r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+",
-            r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9]+",
-            r"\S+@\S+",
-        ]
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                if '@' in match and len(match) > 3:
-                    email = match.strip()
-                    #if not any(email.endswith(ext) for ext in ['.com', '.net', '.org', '.edu', '.gov', '.io', '.co', '.hk']):
-                    #    return email
-                    return email
-        return None
     def has_excessive_spaces(self, text: str) -> bool:
         #logger.warning(f"text: {text}")
         return " " not in text
@@ -1418,28 +1967,31 @@ class FormFieldDetector:
         text = text.replace(')', ') ')
         text = re.sub(r'\s+', ' ', text).strip()
         return text
-    def _find_label_entity(self, entities: List[Dict], label_text: str) -> Optional[Dict]:
-        if not label_text:
-            return None
-        if len(label_text.strip()) == 1 and label_text.strip() in "✓✔☑√":
-            logger.warning(f"Skipping single symbol label: '{label_text}'")
-            return None
-        search_text = self._normalize_text_for_matching(label_text)
-        search_text = re.sub(r'[✓✔☑√]', '', search_text).strip()
-        strategies = [
-            lambda e, s: self._normalize_text_for_matching(e.get("value", "")) == s,
-            lambda e, s: s in self._normalize_text_for_matching(e.get("value", "")),
-            lambda e, s: self._normalize_text_for_matching(e.get("value", "")) in s,
-            lambda e, s: self._partial_match_score(
-                self._normalize_text_for_matching(e.get("value", "")),
-                s
-            ) >= 0.8,
-            lambda e, s: self._clean_for_comparison(e.get("value", "")) == self._clean_for_comparison(label_text),
-        ]
-        for strategy in strategies:
-            for e in entities:
-                if strategy(e, search_text):
-                    logger.info(f"Found label using strategy {strategies.index(strategy)+1}: '{e.get('value', '')}'")
+    def _find_label_entity(self, entities: List[Dict], key_field: str) -> Optional[Dict]:
+        key_lower = key_field.lower()
+        
+        # Map common key_fields to expected patterns
+        pattern_map = {
+            "form number": [r"form\s+no", r"form\s+gf\d+", r"reference\s+no"],
+            "applicant name": [r"applicant", r"name.*organization", r"owner.*name"],
+            "issue date": [r"issue\s+date", r"date\s+of\s+issue"],
+            "completion date": [r"completion\s+date", r"date\s+of\s+completion"],
+        }
+        
+        patterns = []
+        for k, v in pattern_map.items():
+            if k in key_lower:
+                patterns.extend(v)
+        
+        if not patterns:
+            # Fallback: split key_field into words
+            keywords = re.findall(r'\w+', key_lower)
+            patterns = [r".*" + r".*".join(keywords) + r".*"]
+        
+        for e in entities:
+            text = e.get("value", "").lower()
+            for pat in patterns:
+                if re.search(pat, text, re.IGNORECASE):
                     return e
         return None
     def _clean_for_comparison(self, text: str) -> str:
@@ -1459,162 +2011,181 @@ class FormFieldDetector:
         union = len(words1.union(words2))
         return intersection / union if union > 0 else 0.0
     import re
+
     def _find_nearest_value_entity(self, entities: List[Dict], label_entity: Dict, label_text: str) -> Optional[Dict]:
         if not label_entity:
             return None
+
         label_bbox = label_entity.get("bbox", {})
         label_page = label_entity.get("page_number", 1)
-        label_x = label_bbox.get("x", 0)
-        label_y = label_bbox.get("y", 0)
-        label_width = label_bbox.get("width", 0)
-        label_height = label_bbox.get("height", 0)
-        page_entities = [e for e in entities if e.get("page_number", 1) == label_page]
-        page_entities.sort(key=lambda e: (e.get("bbox", {}).get("y", 0), e.get("bbox", {}).get("x", 0)))
-        label_index = -1
-        for i, e in enumerate(page_entities):
-            if e.get("value", "") == label_entity.get("value", ""):
-                label_index = i
-                break
-        candidates = []
-        if label_index >= 0 and label_index + 1 < len(page_entities):
-            next_entity = page_entities[label_index + 1]
-            next_bbox = next_entity.get("bbox", {})
-            next_x = next_bbox.get("x", 0)
-            next_y = next_bbox.get("y", 0)
-            if (next_x > label_x and
-                abs(next_y - label_y) < label_height * 2 and
-                abs((next_y + next_bbox.get("height", 0)) - (label_y + label_height)) < label_height * 2):
-                candidates.append({
-                    "entity": next_entity,
-                    "distance": abs(next_x - (label_x + label_width)),
-                    "type": "immediate_right",
-                    "score": 1.0
-                })
+        lx = label_bbox.get("x", 0)
+        ly = label_bbox.get("y", 0)
+        lw = label_bbox.get("width", 0)
+        lh = label_bbox.get("height", 0)
+
+        best_candidate = None
+        min_distance = float('inf')
+
         for e in entities:
             if e is label_entity:
                 continue
             if e.get("page_number", 1) != label_page:
                 continue
-            e_bbox = e.get("bbox", {})
-            e_x = e_bbox.get("x", 0)
-            e_y = e_bbox.get("y", 0)
-            e_width = e_bbox.get("width", 0)
-            e_height = e_bbox.get("height", 0)
-            is_to_right = e_x > label_x
-            if is_to_right:
-                horizontal_dist = e_x - (label_x + label_width)
-                label_center_y = label_y + label_height / 2
-                e_center_y = e_y + e_height / 2
-                vertical_diff = abs(e_center_y - label_center_y)
-                max_vertical_diff = max(label_height, e_height) * 1.5
-                vertical_score = max(0, 1 - (vertical_diff / max_vertical_diff))
-                score = vertical_score * 0.7 + (1 / (horizontal_dist + 1)) * 0.3
-                if horizontal_dist < 1000 and vertical_diff < label_height * 3:
-                    candidates.append({
-                        "entity": e,
-                        "distance": horizontal_dist,
-                        "type": "spatial_right",
-                        "score": score,
-                        "vertical_diff": vertical_diff,
-                        "horizontal_dist": horizontal_dist
-                    })
+            val = e.get("value", "").strip()
+            if not val:
+                continue
+            # Skip other labels
+            if self._is_email_label(val) or self._is_phone_label(val):
+                continue
+
+            bbox = e.get("bbox", {})
+            ex = bbox.get("x", 0)
+            ey = bbox.get("y", 0)
+            ew = bbox.get("width", 0)
+            eh = bbox.get("height", 0)
+
+            # Restrict search to reasonable area: right or below within 500px
+            if ex > lx + lw + 500 or ey > ly + lh + 300:
+                continue
+            if ex + ew < lx - 200 or ey + eh < ly - 50:
+                continue
+
+            # Compute distance between label right-center and entity left-center
+            label_anchor_x = lx + lw
+            label_anchor_y = ly + lh / 2
+            entity_anchor_x = ex
+            entity_anchor_y = ey + eh / 2
+
+            dx = entity_anchor_x - label_anchor_x
+            dy = entity_anchor_y - label_anchor_y
+            distance = sqrt(dx*dx + dy*dy)
+
+            if distance < min_distance:
+                min_distance = distance
+                best_candidate = e
+
+        if best_candidate:
+            logger.info(f"Nearest value for '{label_text}': '{best_candidate.get('value', '')}' (dist={min_distance:.1f})")
+        return best_candidate
+
+    def find_checkbox_region(entities: List[Dict]) -> Tuple[int, int, int, int]:
+        """Find checkbox region with generous boundaries to include all checkboxes"""
+        if not entities:
+            logger.warning("No entities found, using entire page")
+            return 0, 0, 10000, 10000
+        
+        # Get overall document bounds
+        all_x1, all_y1, all_x2, all_y2 = [], [], [], []
         for e in entities:
-            if e is label_entity:
-                continue
-            if e.get("page_number", 1) != label_page:
-                continue
-            e_bbox = e.get("bbox", {})
-            e_x = e_bbox.get("x", 0)
-            e_y = e_bbox.get("y", 0)
-            e_width = e_bbox.get("width", 0)
-            e_height = e_bbox.get("height", 0)
-            is_below = e_y > label_y + label_height
-            if is_below:
-                horizontal_alignment = abs(e_x - label_x) < label_width * 2
-                if horizontal_alignment:
-                    vertical_dist = e_y - (label_y + label_height)
-                    score = 1 / (vertical_dist + 1)
-                    candidates.append({
-                        "entity": e,
-                        "distance": vertical_dist,
-                        "type": "below",
-                        "score": score,
-                        "vertical_dist": vertical_dist
-                    })
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(f"Top 5 candidates for label '{label_text}':")
-        for i, cand in enumerate(candidates[:5]):
-            logger.info(f"  {i+1}. '{cand['entity'].get('value', '')}' (type: {cand['type']}, score: {cand['score']:.3f})")
-        if candidates and candidates[0]["score"] > 0.1:
-            best = candidates[0]["entity"]
-            logger.info(f"Selected value: '{best.get('value', '')}'")
-            return best
-        return None
-    
+            bbox = e.get("bbox", {})
+            x1 = bbox.get("x", 0)
+            y1 = bbox.get("y", 0)
+            x2 = x1 + bbox.get("width", 0)
+            y2 = y1 + bbox.get("height", 0)
+            
+            all_x1.append(x1)
+            all_y1.append(y1)
+            all_x2.append(x2)
+            all_y2.append(y2)
+        
+        if not all_x1:
+            logger.warning("No valid bounding boxes found")
+            return 0, 0, 10000, 10000
+        
+        # Find document boundaries
+        doc_left = min(all_x1)
+        doc_right = max(all_x2)
+        doc_top = min(all_y1)
+        doc_bottom = max(all_y2)
+        doc_width = doc_right - doc_left
+        doc_height = doc_bottom - doc_top
+        
+        logger.info(f"Document bounds: {doc_left}x{doc_top} to {doc_right}x{doc_bottom} ({doc_width}x{doc_height})")
+        
+        # Checkbox region: typically starts from middle to bottom of document
+        # Use very generous bounds to ensure we capture all checkboxes
+        region_left = max(0, doc_left - 100)  # Add 100px padding left
+        region_right = min(10000, doc_right + 100)  # Add 100px padding right
+        
+        # Vertical region: start from 40% of document height (not too high)
+        # to 90% of document height (not too low)
+        region_top = max(0, int(doc_top + (doc_height * 0.4)))
+        region_bottom = min(10000, int(doc_top + (doc_height * 0.9)))
+        
+        # If document is very small, adjust bounds
+        if doc_height < 500:
+            region_top = max(0, doc_top)
+            region_bottom = min(10000, doc_bottom)
+        
+        logger.info(f"Checkbox region (generous): {region_left}, {region_top}, {region_right}, {region_bottom}")
+        
+        # Now refine by looking for vertical clusters of text
+        # This helps when checkboxes are in the middle of the document
+        vertical_entities = []
+        for e in entities:
+            bbox = e.get("bbox", {})
+            y_center = bbox.get("y", 0) + (bbox.get("height", 0) / 2)
+            
+            # Check if entity is within our generous vertical bounds
+            if region_top <= y_center <= region_bottom:
+                vertical_entities.append(e)
+        
+        # If we found entities in the vertical region, adjust bounds to include them
+        if vertical_entities:
+            vert_y1 = min(e.get("bbox", {}).get("y", region_top) for e in vertical_entities)
+            vert_y2 = max(e.get("bbox", {}).get("y", 0) + e.get("bbox", {}).get("height", 0) 
+                        for e in vertical_entities)
+            
+            # Expand vertical bounds by 100px to be safe
+            region_top = max(0, vert_y1 - 100)
+            region_bottom = min(10000, vert_y2 + 100)
+            
+            # Also adjust horizontal bounds based on these entities
+            vert_x1 = min(e.get("bbox", {}).get("x", region_left) for e in vertical_entities)
+            vert_x2 = max(e.get("bbox", {}).get("x", 0) + e.get("bbox", {}).get("width", 0) 
+                        for e in vertical_entities)
+            
+            region_left = max(0, vert_x1 - 100)
+            region_right = min(10000, vert_x2 + 100)
+            
+            logger.info(f"Refined checkbox region: {region_left}, {region_top}, {region_right}, {region_bottom}")
+        
+        return (region_left, region_top, region_right, region_bottom)
+
     def detect_individual_checkbox_fields(self, entities: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Detect individual checkbox options as separate fields with robust validation"""
-        logger.info("Starting INDIVIDUAL checkbox detection")
+        """Detect checkbox options with strict validation"""
+        logger.info("Starting STRICT individual checkbox detection")
         
-        region = find_checkbox_region(entities)
-        logger.info(f"Checkbox region: {region}")
+        # Find checkbox region with tighter boundaries
+        region = self._find_checkbox_region(entities)
+        region_entities = [e for e in entities if self._is_in_region(e, region)]
         
-        region_entities = [e for e in entities if _is_in_region(e, region)]
-        logger.info(f"Entities in checkbox region: {len(region_entities)}")
-        
+        # Filter out section headers/instructions
         section_headers = []
         section_header_patterns = [
-            r"tick.*box.*only",
-            r"please.*tick",
-            r"appropriate.*box",
-            r"only.*one.*allowed",
-            r"hereby.*apply.*following",
+            r"tick.*box.*only", r"please.*tick", r"appropriate.*box",
+            r"only.*one.*allowed", r"hereby.*apply.*following",
+            r"due to:", r"reason for:", r"只可選擇一項", r"作出以下申請"
         ]
-        
         for e in region_entities:
             text = e.get("value", "").lower()
             for pattern in section_header_patterns:
                 if re.search(pattern, text, re.IGNORECASE):
                     section_headers.append(e)
-                    logger.info(f"Excluding section header: '{e.get('value', '')}'")
                     break
         
-        checkbox_patterns = [
-            r"loss.*of.*certificate",
-            r"replacement.*copy.*certificate.*registration.*generating.*facility.*due.*to",
-            r"damage.*\(.*damaged.*certificate.*must.*returned.*deletion.*\)",
-            r"deletion.*of.*generating.*facility",
-        ]
-        
+        # Identify checkbox candidates with strict validation
         checkbox_candidates = []
         for e in region_entities:
             if e in section_headers:
                 continue
-                
             value = e.get("value", "").strip()
             if not value:
                 continue
-            
-            value_lower = value.lower()
-            is_checkbox = False
-            for pattern in checkbox_patterns:
-                if re.search(pattern, value_lower, re.IGNORECASE):
-                    is_checkbox = True
-                    break
-            
-            if not is_checkbox:
-                has_checkmark = any(symbol in value for symbol in ["✓", "✔", "☑", "√"])
-                has_parentheses = "(" in value and ")" in value
-                content_words = ["loss", "damage", "replacement", "deletion", "returned", "certificate"]
-                content_count = sum(1 for word in content_words if word in value_lower)
-                text_len = len(value)
-                if (3 < content_count < 10 and text_len >= 20 and text_len <= 300):
-                    is_checkbox = True
-            
-            if is_checkbox:
+            if self._is_checkbox_option(value):
                 checkbox_candidates.append(e)
-                logger.info(f"Found checkbox candidate: '{value}'")
         
-        # Robust deduplication
+        # Deduplicate candidates
         unique_candidates = []
         seen_texts = set()
         seen_positions = set()
@@ -1624,53 +2195,90 @@ class FormFieldDetector:
             bbox = cand.get("bbox", {})
             pos_key = (bbox.get("x", 0), bbox.get("y", 0))
             
-            # Skip if exact position already seen
-            if pos_key in seen_positions:
+            if pos_key in seen_positions or text in seen_texts:
                 continue
                 
-            # Skip if exact text already seen
-            if text in seen_texts:
-                continue
-                
-            # Check for similar text (within 85% similarity)
-            is_similar = False
-            for seen_text in seen_texts:
-                if self._partial_match_score(text, seen_text) >= 0.85:
-                    is_similar = True
-                    break
-            
+            # Check similarity to avoid near-duplicates
+            is_similar = any(
+                self._partial_match_score(text, seen) >= 0.9  # Higher threshold
+                for seen in seen_texts
+            )
             if not is_similar:
                 unique_candidates.append(cand)
                 seen_texts.add(text)
                 seen_positions.add(pos_key)
-                logger.info(f"Added unique checkbox: '{cand.get('value', '').strip()}'")
         
-        unique_candidates.sort(key=lambda e: e.get("bbox", {}).get("y", 0))
+        # Sort by vertical position and limit to reasonable count
+        unique_candidates.sort(key=lambda x: x.get("bbox", {}).get("y", 0))
+        unique_candidates = unique_candidates[:6]  # Max 6 checkbox options
         
+        if not unique_candidates:
+            logger.warning("No checkbox candidates found after strict filtering")
+            return [], []
+        
+        # Final validation: Each candidate must match checkbox patterns and not be instructional
+        validated_candidates = []
+        for cand in unique_candidates:
+            text = cand.get("value", "").strip().lower()
+            
+            # Must NOT contain instructional words
+            instructional_words = [
+                "please", "tick", "select", "choose", "indicate", "mark", 
+                "note", "instruction", "must", "should", "will", "may"
+            ]
+            if any(word in text for word in instructional_words):
+                continue
+                
+            # Must match specific checkbox option patterns
+            checkbox_patterns = [
+                r"^loss.*certificate$",
+                r"^damage\s*\(.*\)$",
+                r"^replacement.*copy$",
+                r"^deletion.*facility$",
+                r"^change.*owner$"
+            ]
+            if not any(re.search(pattern, text, re.IGNORECASE) for pattern in checkbox_patterns):
+                continue
+                
+            validated_candidates.append(cand)
+        
+        if not validated_candidates:
+            logger.warning("No candidates passed final validation")
+            return [], []
+        
+        # Determine checked status and build results
+        tick_symbols = ["✓", "✔", "☑", "√", "[x]", "[X]", "(x)", "(X)"]
+        checked_index = None
+        
+        # Check for tick symbols in ORIGINAL text
+        for i, cand in enumerate(validated_candidates):
+            original_text = cand.get("value", "")
+            if any(symbol in original_text for symbol in tick_symbols):
+                checked_index = i
+                break
+        
+        # If no explicit tick, assume FIRST option is selected (common in forms)
+        if checked_index is None:
+            checked_index = 0
+            logger.info("No explicit tick found; assuming first option is selected")
+        
+        # Build results
         individual_results = []
         filtered_entities = []
         
-        for idx, cand in enumerate(unique_candidates):
-            value = cand.get("value", "").strip()
+        for idx, cand in enumerate(validated_candidates):
+            original_text = cand.get("value", "").strip()
             bbox = cand.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
             conf = float(cand.get("confidence", 0.9))
             page_num = cand.get("page_number", 1)
             
-            # Clean the value
-            words = value.split()
-            unique_words = []
-            for word in words:
-                if word not in unique_words:
-                    unique_words.append(word)
-            cleaned_value = " ".join(unique_words)
-            cleaned_value = re.sub(r'\s+', ' ', cleaned_value).strip()
-            cleaned_value = re.sub(r'^[:\-.,\s]+|[:\-.,\s]+$', '', cleaned_value)
+            # Clean value: remove tick symbols and extra punctuation
+            cleaned_value = original_text
+            for symbol in tick_symbols:
+                cleaned_value = cleaned_value.replace(symbol, "")
+            cleaned_value = re.sub(r'^[:\-.,\s]+|[:\-.,\s]+$', '', cleaned_value).strip()
             
-            # Check if it's checked
-            is_checked = any(symbol in cleaned_value for symbol in ["✓", "✔", "☑", "√", "[x]", "[X]"])
-            if is_checked:
-                cleaned_value = re.sub(r'[✓✔☑√\[x\]X]', '', cleaned_value).strip()
-            
+            is_checked = (idx == checked_index)
             field_name = f"checkbox_option_{idx+1}"
             
             result = {
@@ -1686,13 +2294,12 @@ class FormFieldDetector:
                 "confidence": conf,
                 "bbox": bbox,
                 "context_entities": [],
-                "extraction_method": "individual_checkbox_detection",
+                "extraction_method": "strict_checkbox_detection",
                 "meta": {
-                    "original_text": value,
+                    "original_text": original_text,
                     "is_checked": is_checked,
                     "checkbox_index": idx + 1,
-                    "total_checkboxes": len(unique_candidates),
-                    "region_found": region != (0, 0, 10000, 10000),
+                    "total_checkboxes": len(validated_candidates),
                 },
                 "page_number": page_num
             }
@@ -1710,15 +2317,58 @@ class FormFieldDetector:
             individual_results.append(result)
             filtered_entities.append(filtered_entity)
             
-            logger.info(f"Individual checkbox {idx+1}: '{cleaned_value}' (checked: {is_checked})")
+            logger.info(f"Validated checkbox {idx+1}: '{cleaned_value}' (checked: {is_checked})")
         
-        if individual_results:
-            logger.info(f"Found {len(individual_results)} individual checkboxes")
-            return individual_results, filtered_entities
+        logger.info(f"Detected {len(individual_results)} checkboxes after strict validation")
+        return individual_results, filtered_entities
         
-        logger.warning("No individual checkboxes found")
-        return [], []
-    
+    def _is_checkbox_option(self, text: str) -> bool:
+        """Stricter validation for checkbox options with context awareness"""
+        if not text or len(text.strip()) < 3:
+            return False
+            
+        text_lower = text.lower().strip()
+        
+        # Skip non-checkbox patterns (more comprehensive)
+        skip_patterns = [
+            r"section\s+\w+", r"part\s+\w+", r"instructions?", r"note[:\s]",
+            r"confidential", r"form\s+no", r"page\s+\d+", r"application\s+fee",
+            r"receipt\s+number", r"tick\s+one\s+box", r"please\s+tick",
+            r"only\s+one", r"hereby\s+apply", r"作出以下申請", r"只可選擇一項",
+            r"請在適當空格加", r"適用於", r"請選擇", r"form\s+gf"
+        ]
+        for pattern in skip_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return False
+        
+        # Must contain at least one checkbox keyword AND proper context
+        checkbox_keywords = {
+            "loss": ["loss", "missing", "lost"],
+            "damage": ["damage", "damaged", "broken"],
+            "replacement": ["replacement", "repl"],
+            "deletion": ["deletion", "delete", "remove"],
+            "certificate": ["certificate", "cert"]
+        }
+        
+        has_valid_context = False
+        for category, keywords in checkbox_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                # Require contextual indicators for validation
+                if category == "loss":
+                    has_valid_context = any(ctx in text_lower for ctx in ["certificate", "cert", "application"])
+                elif category == "damage":
+                    has_valid_context = any(ctx in text_lower for ctx in ["certificate", "facility", "must be returned"])
+                elif category in ["replacement", "deletion", "certificate"]:
+                    has_valid_context = True
+                break
+        
+        # Require structural indicators (parentheses, etc.)
+        has_parentheses = "(" in text and ")" in text
+        is_short_phrase = 3 <= len(text.split()) <= 6 and len(text) <= 100
+        
+        # Only accept if has valid context AND structural indicators
+        return has_valid_context and (has_parentheses or is_short_phrase)
+   
     def detect_checkbox_field(self, entities: List[Dict]) -> Tuple[Optional[Dict], List[Dict]]:
         """Detect checkbox fields with robust validation"""
         logger.info("Starting specialized checkbox detection")
@@ -1829,7 +2479,7 @@ class FormFieldDetector:
                 continue
                 
             if any(option_word in value.lower() for option_word in [
-                "replacement", "damage", "loss", "certificate", "deletion"
+                "replacement", "damage", "certificate", "deletion"
             ]):
                 final_candidates.append(cand)
         
@@ -1919,7 +2569,897 @@ class FormFieldDetector:
             "meta": {"reason": "No checkbox options found after filtering"},
         }
         return [empty_result], [empty_result]
-       
+
+    def _build_phone_result(self, key_field: str, value: str, bbox: Dict, conf: float, entity: Dict, method: str = "unknown", meta: Dict = None):
+        if meta is None:
+            meta = {}
+        result = {
+            "field_name": key_field,
+            "value": value,
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "phone",
+                "value": value,
+                "confidence": conf,
+                "bbox": bbox,
+            },
+            "confidence": conf,
+            "bbox": bbox,
+            "context_entities": [],
+            "extraction_method": method,
+            "meta": meta,
+        }
+        filtered_entity = {
+            "field": key_field,
+            "value": value,
+            "bbox": bbox,
+            "confidence": conf,
+            "page_number": entity.get("page_number", 1),
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": conf,
+        }
+        return result, [filtered_entity]
+
+    def _build_empty_phone_result(self, key_field: str):
+        empty_bbox = {"x": 0, "y": 0, "width": 1, "height": 1}
+        result = {
+            "field_name": key_field,
+            "value": "Not found",
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "phone",
+                "value": "Not found",
+                "confidence": 0.0,
+                "bbox": empty_bbox,
+            },
+            "confidence": 0.0,
+            "bbox": empty_bbox,
+            "context_entities": [],
+            "extraction_method": "none",
+            "meta": {"reason": "No valid phone detected near label"},
+        }
+        filtered_entity = {
+            "field": key_field,
+            "value": "Not found",
+            "bbox": empty_bbox,
+            "confidence": 0.0,
+            "page_number": 1,
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": 0.0,
+        }
+        return result, [filtered_entity]
+
+    def _find_best_relation(self, relations: List[Dict], key_field: str, field_type: str) -> Tuple[Optional[Dict], float]:
+        """Find best matching relation using semantic and spatial scoring"""
+        best_relation = None
+        best_score = 0
+        
+        # Get field-specific patterns for scoring
+        patterns = self._get_field_patterns(key_field)
+        
+        for rel in relations:
+            label_text = rel.get("label_text", "").lower()
+            key_lower = key_field.lower()
+            
+            # Semantic score based on pattern matching
+            pattern_score = sum(1 for p in patterns if p in label_text) / max(1, len(patterns))
+            
+            # Spatial score (lower distance = higher score)
+            spatial_score = 1.0 / (1.0 + rel.get("distance", 100))
+            
+            # Field-type specific boost
+            type_boost = 0.1 if field_type in label_text else 0
+            
+            # Combined score
+            total_score = pattern_score * 0.6 + spatial_score * 0.3 + type_boost
+            
+            if total_score > best_score:
+                best_score = total_score
+                best_relation = rel
+        
+        return best_relation, best_score
+
+    def _build_result_from_relation(self, relation: Dict, key_field: str, field_type: str) -> Tuple[Dict, List[Dict]]:
+        """Build result from LiLT relation"""
+        value_text = relation.get("value_text", "Not found")
+        bbox = relation.get("value_bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+        conf = float(relation.get("confidence", 0.8))
+        
+        # Apply field-type specific cleaning
+        cleaned_value = self._clean_field_value(value_text, field_type)
+        
+        result = {
+            "field_name": key_field,
+            "value": cleaned_value,
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": field_type,
+                "value": cleaned_value,
+                "confidence": conf,
+                "bbox": bbox,
+            },
+            "confidence": conf,
+            "bbox": bbox,
+            "context_entities": [],
+            "extraction_method": "lilt_relation_extraction",
+            "meta": {
+                "label_text": relation.get("label_text", ""),
+                "relation_score": relation.get("score", 0),
+                "model_used": True,
+            },
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": cleaned_value,
+            "bbox": bbox,
+            "confidence": conf,
+            "page_number": relation.get("page_number", 1),
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": conf,
+        }
+        
+        return result, [filtered_entity]
+
+    def _pattern_based_extraction(self, entities: List[Dict], key_field: str, field_type: str) -> Tuple[Dict, List[Dict]]:
+        """Enhanced pattern-based extraction with validation"""
+        # Map field types to expected patterns
+        pattern_map = {
+            "document_id": [r"form\s+no", r"reference\s+no", r"reg\s+no", r"ad_\d+", r"gf\d+", r"pp-\d+"],
+            "person_name": [r"name.*organization", r"owner.*name", r"applicant", r"company\s+name"],
+            "date": [r"issue\s+date", r"completion\s+date", r"date\s+of\s+", r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"],
+            "address": [r"correspondence\s+address", r"contact\s+address", r"mailing\s+address", r"address\s+of"],
+            "phone": [r"contact\s+tel", r"phone\s+no", r"telephone"],
+            "email": [r"email\s+address", r"e-mail", r"mail\s+address"],
+        }
+        
+        # Get patterns for this field
+        patterns = pattern_map.get(field_type, [])
+        if not patterns:
+            # Fallback to key_field patterns
+            patterns = self._get_field_patterns(key_field)
+        
+        # Try to find label with patterns
+        label_entity = None
+        for e in entities:
+            text = e.get("value", "").lower()
+            for pat in patterns:
+                if re.search(pat, text, re.IGNORECASE):
+                    label_entity = e
+                    logger.info(f"Found label via pattern '{pat}': '{e.get('value', '')}'")
+                    break
+            if label_entity:
+                break
+        
+        # Try to find value
+        if label_entity:
+            value_entity = self._find_value_for_label(entities, label_entity, field_type)
+            if value_entity:
+                value_text = value_entity.get("value", "").strip()
+                # Apply field-type specific cleaning
+                cleaned_value = self._clean_field_value(value_text, field_type)
+                return self._build_result_from_entities(label_entity, value_entity, key_field, cleaned_value, field_type)
+        
+        # Global search for values that match field type
+        candidates = []
+        for e in entities:
+            value_text = e.get("value", "").strip()
+            if self._validate_field_value(value_text, field_type):
+                candidates.append((value_text, e))
+        
+        if candidates:
+            # Pick the most confident candidate
+            best_candidate = max(candidates, key=lambda x: x[1].get("confidence", 0))
+            value_text, entity = best_candidate
+            return self._build_result_from_entity(entity, key_field, value_text, field_type)
+        
+        # Ultimate fallback
+        return self._build_empty_result(key_field)
+
+    def _build_email_result(self, key_field: str, value: str, bbox: Dict, conf: float, entity: Dict, method: str = "unknown", meta: Dict = None):
+        """Build structured result for email field"""
+        if meta is None:
+            meta = {}
+        
+        # Determine if email was found
+        is_found = value != "Not found" and self._is_valid_email_format(value)
+        
+        result = {
+            "field_name": key_field,
+            "value": value,
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "email",
+                "value": value,
+                "confidence": conf,
+                "bbox": bbox,
+            },
+            "confidence": conf,
+            "bbox": bbox,
+            "context_entities": [],
+            "extraction_method": method,
+            "meta": meta,
+            "found": is_found  # FIXED: Proper "found" flag
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": value,
+            "bbox": bbox,
+            "confidence": conf,
+            "page_number": entity.get("page_number", 1),
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": conf,
+            "found": is_found  # FIXED: Proper "found" flag
+        }
+        
+        return result, [filtered_entity]
+
+    def _build_empty_email_result(self, key_field: str):
+        """Build empty result for missing email field"""
+        empty_bbox = {"x": 0, "y": 0, "width": 1, "height": 1}
+        
+        result = {
+            "field_name": key_field,
+            "value": "Not found",
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "email",
+                "value": "Not found",
+                "confidence": 0.0,
+                "bbox": empty_bbox,
+            },
+            "confidence": 0.0,
+            "bbox": empty_bbox,
+            "context_entities": [],
+            "extraction_method": "none",
+            "meta": {"reason": "No valid email detected near label"},
+            "found": False  # FIXED: Proper "found" flag for empty result
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": "Not found",
+            "bbox": empty_bbox,
+            "confidence": 0.0,
+            "page_number": 1,
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": 0.0,
+            "found": False  # FIXED: Proper "found" flag for empty result
+        }
+        
+        return result, [filtered_entity]
+
+    def _is_valid_email_format(self, email: str) -> bool:
+        """Validate email format matches expected patterns"""
+        if not email or not isinstance(email, str):
+            return False
+        
+        email = email.strip().lower()
+        
+        # Basic email pattern validation
+        email_pattern = r'^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$'
+        if not re.match(email_pattern, email):
+            return False
+        
+        # Domain validation - check for realistic TLDs
+        domain = email.split('@')[-1]
+        valid_tlds = ['.com', '.net', '.org', '.edu', '.gov', '.io', '.co', '.hk', '.asia']
+        
+        return any(domain.endswith(tld) for tld in valid_tlds)
+
+    def _extract_email(self, text: str) -> Optional[str]:
+        """Extract email with robust OCR error handling"""
+        if not text:
+            return None
+        
+        # Preprocess text to fix common OCR errors in emails
+        cleaned_text = self._clean_ocr_email_artifacts(text)
+        
+        # Multiple email patterns with increasing tolerance
+        email_patterns = [
+            # Strict pattern (ideal case)
+            r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+            # Tolerant pattern (handles spaces around dots)
+            r'[a-zA-Z0-9._%+-]+\s*@\s*[a-zA-Z0-9.-]+\s*\.\s*[a-zA-Z]{2,}',
+            # Very tolerant pattern (handles most OCR errors)
+            r'[a-zA-Z0-9._%+-]+[\s@]+[a-zA-Z0-9.-]+[\s.]+[a-zA-Z]{2,}'
+        ]
+        
+        for pattern in email_patterns:
+            matches = re.finditer(pattern, cleaned_text, re.IGNORECASE)
+            for match in matches:
+                email_candidate = match.group(0)
+                # Final cleanup and validation
+                cleaned_email = self._sanitize_email(email_candidate)
+                if self._is_valid_email_format(cleaned_email):
+                    logger.info(f"✅ Found valid email after cleaning: '{cleaned_email}' from '{email_candidate}'")
+                    return cleaned_email
+        
+        # Fallback: Look for @ symbol and extract surrounding text
+        if '@' in cleaned_text:
+            parts = cleaned_text.split('@')
+            if len(parts) > 1:
+                local_part = parts[0].strip()[-30:]  # Take last 30 chars of local part
+                domain_part = parts[1].strip()[:50]   # Take first 50 chars of domain
+                email_candidate = f"{local_part}@{domain_part}"
+                cleaned_email = self._sanitize_email(email_candidate)
+                if self._is_valid_email_format(cleaned_email):
+                    logger.info(f"✅ Found email via fallback method: '{cleaned_email}'")
+                    return cleaned_email
+        
+        return None
+
+    def _clean_ocr_email_artifacts(self, text: str) -> str:
+        """Clean common OCR artifacts in email addresses"""
+        if not text:
+            return text
+        
+        # Clean whitespace around @ and . symbols
+        text = re.sub(r'\s*@\s*', '@', text)
+        text = re.sub(r'\s*\.\s*', '.', text)
+        
+        # Fix common OCR misreads
+        text = re.sub(r'@rn', '@m', text, flags=re.IGNORECASE)  # @rn -> @m
+        text = re.sub(r'@rr', '@m', text, flags=re.IGNORECASE)  # @rr -> @m
+        text = re.sub(r'@ii', '@m', text, flags=re.IGNORECASE)  # @ii -> @m
+        text = re.sub(r'@iii', '@m', text, flags=re.IGNORECASE) # @iii -> @m
+        text = re.sub(r'\bi\s*rn\b', 'im', text, flags=re.IGNORECASE)  # imrn -> im
+        text = re.sub(r'\bi\s*rr\b', 'ir', text, flags=re.IGNORECASE)  # irrn -> ir
+        
+        # Fix domain suffixes
+        text = re.sub(r'\.coin\b', '.com', text, flags=re.IGNORECASE)
+        text = re.sub(r'\.cori\b', '.com', text, flags=re.IGNORECASE)
+        text = re.sub(r'\.corm\b', '.com', text, flags=re.IGNORECASE)
+        text = re.sub(r'\.nci\b', '.net', text, flags=re.IGNORECASE)
+        text = re.sub(r'\.gel\b', '.org', text, flags=re.IGNORECASE)
+        text = re.sub(r'\.hk\b', '.hk', text, flags=re.IGNORECASE)
+        
+        # Remove special characters that shouldn't be in emails
+        text = re.sub(r'[^\w@.\-+%]', '', text)
+        
+        return text.lower()
+
+    def _sanitize_email(self, email: str) -> str:
+        """Sanitize email by removing invalid characters and normalizing"""
+        if not email:
+            return email
+        
+        # Remove spaces and invalid characters
+        email = re.sub(r'\s+', '', email)
+        email = re.sub(r'[^\w@.\-+%]', '', email)
+        
+        # Fix multiple dots in domain
+        parts = email.split('@')
+        if len(parts) == 2:
+            local, domain = parts
+            # Fix multiple dots in domain (e.g., "domain..com" -> "domain.com")
+            domain = re.sub(r'\.{2,}', '.', domain)
+            # Fix leading/trailing dots
+            domain = domain.strip('.')
+            local = local.strip('.')
+            
+            # Reconstruct email
+            email = f"{local}@{domain}"
+        
+        return email.lower()
+
+    def _is_valid_email_format(self, email: str) -> bool:
+        """Validate email format with realistic domain checking"""
+        if not email or '@' not in email or '.' not in email:
+            return False
+        
+        # Basic format validation
+        if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            return False
+        
+        # Domain validation - check for realistic TLDs
+        domain = email.split('@')[-1].lower()
+        
+        # Common valid TLDs
+        valid_tlds = [
+            '.com', '.net', '.org', '.edu', '.gov', '.io', '.co', '.hk', 
+            '.asia', '.biz', '.info', '.me', '.tv', '.cc', '.us', '.uk',
+            '.ca', '.au', '.jp', '.kr', '.cn', '.tw', '.sg'
+        ]
+        
+        # Check if domain ends with a valid TLD
+        has_valid_tld = any(domain.endswith(tld) for tld in valid_tlds)
+        
+        # Additional checks to reject obviously invalid emails
+        invalid_patterns = [
+            r'@localhost', r'@example\.com', r'@test\.com',  # Test domains
+            r'@\w+\.\w{1,2}$',  # Single letter TLDs
+            r'@[\d.]+$',        # IP addresses as domains
+            r'@no-email', r'@none', r'@not-applicable',      # Placeholder text
+            r'^\.', r'\.$',     # Leading/trailing dots
+            r'@\.+', r'\.@'     # Dots next to @ symbol
+        ]
+        
+        has_invalid_pattern = any(re.search(pattern, email) for pattern in invalid_patterns)
+        
+        return has_valid_tld and not has_invalid_pattern
+
+    def _is_valid_email_value(self, raw_value: str) -> bool:
+        """Validate email value with OCR tolerance"""
+        if not raw_value:
+            return False
+        
+        # Clean the value first
+        cleaned_value = self._clean_ocr_email_artifacts(raw_value)
+        
+        # Apply all validation checks
+        return self._is_valid_email_format(cleaned_value)
+
+    def _build_result_from_entities(self, label_entity: Dict, value_entity: Dict, key_field: str, value_text: str, field_type: str) -> Tuple[Dict, List[Dict]]:
+        """Build result from label and value entities"""
+        bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+        conf = float(value_entity.get("confidence", 0.9))
+        
+        result = {
+            "field_name": key_field,
+            "value": value_text,
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": field_type,
+                "value": value_text,
+                "confidence": conf,
+                "bbox": bbox,
+            },
+            "confidence": conf,
+            "bbox": bbox,
+            "context_entities": [],
+            "extraction_method": "pattern_based_fallback",
+            "meta": {
+                "label_entity": label_entity.get("value", ""),
+                "label_confidence": label_entity.get("confidence", 0),
+            },
+        }
+        filtered_entity = {
+            "field": key_field,
+            "value": value_text,
+            "bbox": bbox,
+            "confidence": conf,
+            "page_number": value_entity.get("page_number", 1),
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": conf,
+        }
+        return result, [filtered_entity]
+
+    def _find_value_entity_with_generous_bounds(self, entities: List[Dict], label_entity: Dict, key_field: str) -> Optional[Dict]:
+        """Find value entity with very generous spatial bounds for email fields"""
+        if not label_entity:
+            return None
+        
+        label_bbox = label_entity.get("bbox", {})
+        label_page = label_entity.get("page_number", 1)
+        label_x = label_bbox.get("x", 0)
+        label_y = label_bbox.get("y", 0)
+        label_width = label_bbox.get("width", 0)
+        label_height = label_bbox.get("height", 0)
+        label_center_y = label_y + label_height / 2
+        
+        candidates = []
+        
+        for e in entities:
+            if e is label_entity:
+                continue
+            
+            if e.get("page_number", 1) != label_page:
+                continue
+            
+            bbox = e.get("bbox", {})
+            x = bbox.get("x", 0)
+            y = bbox.get("y", 0)
+            width = bbox.get("width", 0)
+            height = bbox.get("height", 0)
+            value = e.get("value", "").strip()
+            
+            if not value:
+                continue
+            
+            # Skip obvious non-values (headers, labels, etc.)
+            if self._is_likely_label_or_header(value):
+                continue
+            
+            # Calculate spatial relationships - BE VERY GENEROUS
+            horizontal_dist = x - (label_x + label_width)  # Distance from end of label to start of value
+            vertical_dist = abs((y + height/2) - label_center_y)  # Vertical distance between centers
+            
+            # Candidate if: within generous bounds
+            is_candidate = False
+            position_score = 0.0
+            
+            # 1. Right of label (preferred) - very generous bounds
+            if -100 <= horizontal_dist <= 800 and vertical_dist <= label_height * 3.0:
+                is_candidate = True
+                position_score = 1.0 - (max(0, horizontal_dist) / 800) * 0.5 - (vertical_dist / (label_height * 3.0)) * 0.5
+            
+            # 2. Below label (acceptable) - also generous
+            elif horizontal_dist > -300 and x < label_x + label_width + 300 and y > label_y - label_height * 0.5 and y < label_y + label_height * 4.0:
+                is_candidate = True
+                vertical_penalty = min(1.0, abs(y - (label_y + label_height)) / 400)
+                horizontal_penalty = min(1.0, abs(x - label_x) / (label_width * 2.0))
+                position_score = 0.9 - (vertical_penalty * 0.6 + horizontal_penalty * 0.4)
+            
+            if not is_candidate:
+                continue
+            
+            # Higher priority for entities that contain @ symbol (likely emails)
+            email_boost = 1.5 if "@" in value else 1.0
+            final_score = position_score * email_boost
+            
+            candidates.append({
+                "entity": e,
+                "score": final_score,
+                "position_score": position_score,
+                "value": value,
+                "contains_at": "@" in value
+            })
+        
+        if candidates:
+            # Sort by score and pick the best candidate
+            best_candidate = max(candidates, key=lambda x: x["score"])
+            logger.info(f"Selected email candidate: '{best_candidate['value']}' (score={best_candidate['score']:.2f}, contains_at={best_candidate['contains_at']})")
+            return best_candidate["entity"]
+        
+        return None
+
+    def _find_email_value_first(self, entities: List[Dict], key_field: str) -> Optional[Dict]:
+        """Find email value first, then associate with nearest label"""
+        email_candidates = []
+        
+        for e in entities:
+            value = e.get("value", "").strip()
+            if not value:
+                continue
+            
+            email_val = self._extract_email(value)
+            if email_val and self._is_valid_email_format(email_val):
+                confidence = float(e.get("confidence", 0.7))
+                email_candidates.append({
+                    "entity": e,
+                    "email": email_val,
+                    "confidence": confidence,
+                    "value": value
+                })
+        
+        if not email_candidates:
+            return None
+        
+        # Pick the most confident email candidate
+        best_candidate = max(email_candidates, key=lambda x: x["confidence"])
+        logger.info(f"Found email via value-first approach: '{best_candidate['email']}' (confidence={best_candidate['confidence']:.2f})")
+        return best_candidate["entity"]
+
+    def _find_email_in_label_area(self, entities: List[Dict], label_entity: Dict) -> Optional[Dict]:
+        """Search aggressively in the area around the email label"""
+        if not label_entity:
+            return None
+        
+        label_bbox = label_entity.get("bbox", {})
+        label_page = label_entity.get("page_number", 1)
+        label_x = label_bbox.get("x", 0)
+        label_y = label_bbox.get("y", 0)
+        label_width = label_bbox.get("width", 0)
+        label_height = label_bbox.get("height", 0)
+        
+        # Define a generous search area around the label
+        search_left = max(0, label_x - 200)
+        search_right = label_x + label_width + 600
+        search_top = max(0, label_y - 100)
+        search_bottom = label_y + label_height * 4.0
+        
+        email_candidates = []
+        
+        for e in entities:
+            if e.get("page_number", 1) != label_page:
+                continue
+            
+            bbox = e.get("bbox", {})
+            x = bbox.get("x", 0)
+            y = bbox.get("y", 0)
+            width = bbox.get("width", 0)
+            height = bbox.get("height", 0)
+            value = e.get("value", "").strip()
+            
+            if not value:
+                continue
+            
+            # Check if entity is within search area
+            entity_center_x = x + width / 2
+            entity_center_y = y + height / 2
+            
+            if (search_left <= entity_center_x <= search_right and 
+                search_top <= entity_center_y <= search_bottom):
+                
+                email_val = self._extract_email(value)
+                if email_val and self._is_valid_email_format(email_val):
+                    confidence = float(e.get("confidence", 0.7))
+                    distance_to_label = sqrt((entity_center_x - (label_x + label_width/2))**2 + 
+                                        (entity_center_y - (label_y + label_height/2))**2)
+                    email_candidates.append({
+                        "entity": e,
+                        "email": email_val,
+                        "confidence": confidence,
+                        "distance": distance_to_label,
+                        "value": value
+                    })
+        
+        if email_candidates:
+            # Pick the closest email candidate to the label
+            best_candidate = min(email_candidates, key=lambda x: x["distance"])
+            logger.info(f"Found email in label area: '{best_candidate['email']}' (distance={best_candidate['distance']:.1f})")
+            return best_candidate["entity"]
+        
+        return None
+
+    def _get_nearby_entities(self, entities: List[Dict], reference_entity: Dict, max_distance: int = 100) -> List[Dict]:
+        """Get entities near a reference entity within max_distance pixels"""
+        if not reference_entity:
+            return []
+        
+        ref_bbox = reference_entity.get("bbox", {})
+        ref_x = ref_bbox.get("x", 0) + ref_bbox.get("width", 0) / 2
+        ref_y = ref_bbox.get("y", 0) + ref_bbox.get("height", 0) / 2
+        
+        nearby_entities = []
+        
+        for e in entities:
+            if e is reference_entity:
+                continue
+            
+            bbox = e.get("bbox", {})
+            e_x = bbox.get("x", 0) + bbox.get("width", 0) / 2
+            e_y = bbox.get("y", 0) + bbox.get("height", 0) / 2
+            
+            distance = sqrt((e_x - ref_x)**2 + (e_y - ref_y)**2)
+            
+            if distance <= max_distance:
+                nearby_entities.append(e)
+        
+        return nearby_entities
+
+    def _is_likely_label_or_header(self, text: str) -> bool:
+        """Check if text is likely a label or header rather than a value"""
+        text_lower = text.lower().strip()
+        
+        # Common label/header patterns
+        label_patterns = [
+            r"^email\s+address", r"^e[-\s]?mail", r"^electronic\s+mail",
+            r"^contact\s+information", r"^contact\s+details",
+            r"^section\s+\w+", r"^part\s+\w+", r"^item\s+\w+",
+            r"^\([a-z0-9]+\)", r"^[a-z0-9]+\.",  # Numbered items
+            r"^[A-Z\s]{3,}$",  # ALL CAPS headers
+            r"^for\s+official\s+use", r"^confidential",
+            r"^application\s+form", r"^form\s+\w+",
+            r"^please\s+", r"^tick\s+", r"^select\s+",
+            r"^name", r"^address", r"^phone", r"^tel", r"^contact",
+            r"^date", r"^signature", r"^page\s+\d+",
+            r"^section", r"^part", r"^table", r"^figure"
+        ]
+        
+        for pattern in label_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        
+        return False
+
+    def _build_email_result(self, key_field: str, value: str, bbox: Dict, conf: float, entity: Dict, method: str = "unknown", meta: Dict = None):
+        """Build structured result for email field with proper 'found' flag"""
+        if meta is None:
+            meta = {}
+        
+        # FIXED: Add proper 'found' flag based on whether we actually found a valid email
+        is_found = value != "Not found" and self._is_valid_email_format(value) if value else False
+        
+        result = {
+            "field_name": key_field,
+            "value": value,
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "email",
+                "value": value,
+                "confidence": conf,
+                "bbox": bbox,
+            },
+            "confidence": conf,
+            "bbox": bbox,
+            "context_entities": [],
+            "extraction_method": method,
+            "meta": meta,
+            "found": is_found,  # FIXED: Proper found flag
+            "page_number": entity.get("page_number", 1)
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": value,
+            "bbox": bbox,
+            "confidence": conf,
+            "page_number": entity.get("page_number", 1),
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": conf,
+            "found": is_found  # FIXED: Proper found flag
+        }
+        
+        return result, [filtered_entity]
+
+    def _build_empty_email_result(self, key_field: str):
+        """Build empty result for missing email field with proper 'found' flag"""
+        empty_bbox = {"x": 0, "y": 0, "width": 1, "height": 1}
+        
+        result = {
+            "field_name": key_field,
+            "value": "Not found",
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": "email",
+                "value": "Not found",
+                "confidence": 0.0,
+                "bbox": empty_bbox,
+            },
+            "confidence": 0.0,
+            "bbox": empty_bbox,
+            "context_entities": [],
+            "extraction_method": "none",
+            "meta": {"reason": "No valid email detected"},
+            "found": False,  # FIXED: Proper found flag for empty result
+            "page_number": 1
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": "Not found",
+            "bbox": empty_bbox,
+            "confidence": 0.0,
+            "page_number": 1,
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": 0.0,
+            "found": False  # FIXED: Proper found flag for empty result
+        }
+        
+        return result, [filtered_entity]
+
+    def _find_value_by_pattern(self, entities: List[Dict], key_field: str, field_type: str) -> Optional[Dict]:
+        """Find value by matching against field-type patterns"""
+        candidates = []
+        
+        for e in entities:
+            value = e.get("value", "").strip()
+            if not value:
+                continue
+            
+            # Score based on field-type validation
+            score = 0.0
+            if self._validate_field_value(value, field_type):
+                score = 0.8
+            
+            # Additional score based on position (prefer top-left values for first fields)
+            bbox = e.get("bbox", {})
+            position_score = 1.0 - (bbox.get("y", 0) / 3000)  # Prefer values near top
+            
+            total_score = score + position_score * 0.2
+            
+            if total_score > 0.3:
+                candidates.append({
+                    "entity": e,
+                    "score": total_score,
+                    "validation_match": score > 0
+                })
+        
+        if candidates:
+            best_candidate = max(candidates, key=lambda x: x["score"])
+            logger.info(f"Found value by pattern for '{key_field}': '{best_candidate['entity'].get('value', '')}' "
+                        f"(score={best_candidate['score']:.2f})")
+            return best_candidate["entity"]
+        
+        return None
+
+    def _find_value_near_label(self, entities: List[Dict], label_entity: Dict, key_field: str, field_type: str) -> Optional[Dict]:
+        """Find value entity near label with more generous search criteria"""
+        if not label_entity:
+            return None
+        
+        label_bbox = label_entity.get("bbox", {})
+        label_page = label_entity.get("page_number", 1)
+        label_x = label_bbox.get("x", 0)
+        label_y = label_bbox.get("y", 0)
+        label_width = label_bbox.get("width", 0)
+        label_height = label_bbox.get("height", 0)
+        label_right = label_x + label_width
+        label_bottom = label_y + label_height
+        
+        candidates = []
+        
+        for e in entities:
+            if e is label_entity or e.get("page_number", 1) != label_page:
+                continue
+            
+            e_bbox = e.get("bbox", {})
+            e_x = e_bbox.get("x", 0)
+            e_y = e_bbox.get("y", 0)
+            e_width = e_bbox.get("width", 0)
+            e_height = e_bbox.get("height", 0)
+            e_value = e.get("value", "").strip()
+            
+            if not e_value:
+                continue
+            
+            # Skip labels and instructional text
+            if self._is_label_candidate(e_value):
+                continue
+            
+            # Calculate spatial relationships
+            # For name/organization field, be more generous with search area
+            is_to_right = e_x >= label_right - 50 and e_x <= label_right + 400
+            is_below = e_y >= label_bottom - 30 and e_y <= label_bottom + 200
+            is_same_line = abs(e_y - label_y) < label_height * 0.5
+            
+            # Check if entity is in the general area of the label
+            in_general_area = (
+                e_x >= label_x - 200 and 
+                e_x <= label_x + label_width + 500 and
+                e_y >= label_y - 50 and
+                e_y <= label_y + label_height * 3
+            )
+            
+            if not (is_to_right or is_below or is_same_line or in_general_area):
+                continue
+            
+            # Calculate distance scores
+            horizontal_dist = max(0, e_x - label_right)
+            vertical_dist = max(0, e_y - label_bottom)
+            distance = sqrt(horizontal_dist**2 + vertical_dist**2)
+            
+            # For name/organization field, prioritize closer entities
+            if "name" in key_field.lower() and "owner" in key_field.lower():
+                # Be more generous with distance for this specific field
+                max_distance = 500
+            else:
+                max_distance = 300
+            
+            if distance > max_distance:
+                continue
+            
+            # Score based on position and distance
+            position_score = 0.0
+            if is_to_right and is_same_line:
+                position_score = 1.0  # Best: directly to the right on same line
+            elif is_below and horizontal_dist < 100:
+                position_score = 0.8  # Good: directly below with good alignment
+            elif in_general_area:
+                position_score = 0.6  # Acceptable: in general area
+            
+            # Distance score (closer is better)
+            distance_score = 1.0 - (distance / max_distance)
+            
+            # Field type validation score
+            validation_score = 1.0 if self._validate_field_value(e_value, field_type) else 0.3
+            
+            # Combine scores
+            total_score = position_score * 0.4 + distance_score * 0.3 + validation_score * 0.3
+            
+            if total_score > 0.4:  # Lower threshold to catch more candidates
+                candidates.append({
+                    "entity": e,
+                    "score": total_score,
+                    "distance": distance,
+                    "value": e_value
+                })
+        
+        if candidates:
+            # Sort by score and return best candidate
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            best_candidate = candidates[0]
+            
+            logger.info(f"Found value for '{key_field}': '{best_candidate['value']}' "
+                        f"(score={best_candidate['score']:.2f}, distance={best_candidate['distance']:.1f})")
+            
+            return best_candidate["entity"]
+        
+        return None
+
     def detect_field(self, entities: List[Dict], key_field: str) -> Tuple[Union[Dict, List[Dict], None], List[Dict]]:
         logger.info(f"Detecting field: '{key_field}'")
         logger.info(f"Total entities: {len(entities)}")
@@ -1970,208 +3510,832 @@ class FormFieldDetector:
             logger.info(f"  Entity {idx}: '{e.get('value', '')}'")
         logger.info("=" * 80)
         
-        phone_entities = [e for e in entities if e.get("extraction_phase") == "pre_merge"]
-        if phone_entities and self._is_phone_label(key_field):
-            best_phone = phone_entities[0]
-            bbox = best_phone["bbox"]
-            conf = float(best_phone["confidence"])
-            result = {
-                "field_name": key_field,
-                "value": best_phone["value"],
-                "structured_value": {
-                    "field_name": key_field,
-                    "field_type": "phone",
-                    "value": best_phone["value"],
-                    "confidence": conf,
-                    "bbox": bbox,
-                },
-                "confidence": conf,
-                "bbox": bbox,
-                "context_entities": [],
-                "extraction_method": "pre_merge_phone_extraction",
-                "meta": {"extracted_from": best_phone.get("extracted_from", "")},
-            }
-            filtered_entities = [
-                {
-                    "field": key_field,
-                    "value": best_phone["value"],
-                    "bbox": bbox,
-                    "confidence": conf,
-                    "page_number": best_phone.get("page_number", 1),
-                    "semantic_type": EntityTypes.ANSWER,
-                    "semantic_confidence": conf,
-                }
-            ]
-            return result, filtered_entities
-        
-        if self._is_email_label(key_field):
-            logger.info("Using email-specific extraction logic for key_field")
-            candidates = []
-            for e in entities:
-                val = e.get("value", "")
-                if not val:
-                    continue
-                if self._is_email_label(val):
-                    label_page = e.get("page_number", 1)
-                    lb = e.get("bbox", {})
-                    lx = lb.get("x", 0)
-                    ly = lb.get("y", 0)
-                    lheight = lb.get("height", 0)
-                    for e2 in entities:
-                        if e2 is e:
-                            continue
-                        if e2.get("page_number", 1) != label_page:
-                            continue
-                        b2 = e2.get("bbox", {})
-                        x2 = b2.get("x", 0)
-                        y2 = b2.get("y", 0)
-                        h2 = b2.get("height", 0)
-                        if abs(y2 - ly) <= max(10, int(0.5 * max(lheight, h2))) and x2 > lx:
-                            email_val = self._extract_email(e2.get("value", ""))
-                            if email_val:
-                                candidates.append((email_val, e2))
-            if not candidates:
+        if self._is_phone_label(key_field):
+            logger.info(f"Using model-guided phone extraction for key_field: '{key_field}'")
+
+            # Step 1: Find the label entity using semantic/text matching
+            label_entity = self._find_label_entity(entities, key_field)
+            if not label_entity:
+                logger.warning(f"No label found for phone field: '{key_field}'")
+                # → Fall back to global phone search only if no label exists
                 for e in entities:
-                    v = e.get("value", {})
-                    if self.has_excessive_spaces(v):
-                        email_val = self._extract_email(e.get("value", ""))                        
-                        if email_val:
-                            candidates.append((email_val, e))
-            if candidates:
-                email_val, ent = candidates[0]
-                logger.info(f"Detected email value: {email_val}")
-                bbox = ent.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                conf = float(ent.get("confidence", 0.9))
-                result = {
-                    "field_name": key_field,
-                    "value": email_val,
-                    "structured_value": {
-                        "field_name": key_field,
-                        "field_type": "email",
-                        "value": email_val,
-                        "confidence": conf,
-                        "bbox": bbox,
-                    },
-                    "confidence": conf,
-                    "bbox": bbox,
-                    "context_entities": [],
-                    "extraction_method": "regex_email_from_entities",
-                    "meta": {},
-                }
-                filtered_entities = [
-                    {
-                        "field": key_field,
-                        "value": email_val,
-                        "bbox": bbox,
-                        "confidence": conf,
-                        "page_number": ent.get("page_number", 1),
-                        "semantic_type": EntityTypes.ANSWER,
-                        "semantic_confidence": conf,
-                    }
-                ]
-                return result, filtered_entities
-        
-        logger.info(f"Attempting general key-value detection for: '{key_field}'")
-        label_entity = self._find_label_entity(entities, key_field)
-        if label_entity:
-            logger.info(f"Found label entity: '{label_entity.get('value', '')}'")
-            logger.info(f"Label entity page: {label_entity.get('page_number', 1)}")
+                    phone_val = extract_phone_from_text(e.get("value", ""))
+                    if phone_val:
+                        # Return first valid phone as last resort
+                        bbox = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                        conf = float(e.get("confidence", 0.85))
+                        return self._build_phone_result(key_field, phone_val, bbox, conf, e, method="fallback_global_phone")
+                return self._build_empty_phone_result(key_field)
+
+            # Step 2: Use spatial reasoning to find the NEAREST value
             value_entity = self._find_nearest_value_entity(entities, label_entity, key_field)
-            if value_entity:
-                value_text = value_entity.get("value", "").strip()
-                logger.info(f"Found value entity: '{value_text}'")
-                bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                conf = float(value_entity.get("confidence", 0.9))
-                result = {
-                    "field_name": key_field,
-                    "value": value_text,
-                    "structured_value": {
-                        "field_name": key_field,
-                        "field_type": "text",
-                        "value": value_text,
-                        "confidence": conf,
-                        "bbox": bbox,
-                    },
-                    "confidence": conf,
-                    "bbox": bbox,
-                    "context_entities": [],
-                    "extraction_method": "general_key_value",
-                    "meta": {
-                        "label_entity": label_entity.get("value", ""),
-                        "label_confidence": label_entity.get("confidence", 0),
-                    },
-                }
-                filtered_entities = [
-                    {
-                        "field": key_field,
-                        "value": value_text,
-                        "bbox": bbox,
-                        "confidence": conf,
-                        "page_number": value_entity.get("page_number", 1),
-                        "semantic_type": EntityTypes.ANSWER,
-                        "semantic_confidence": conf,
-                    }
-                ]
-                return result, filtered_entities
-            else:
-                logger.warning(f"Found label but no value entity for: '{key_field}'")
-        else:
-            logger.warning(f"No label entity found for: '{key_field}'")
+            if not value_entity:
+                logger.warning(f"Label found but no nearby value for: '{key_field}'")
+                return self._build_empty_phone_result(key_field)
+
+            # Step 3: Extract & validate phone from the candidate value
+            raw_value = value_entity.get("value", "").strip()
+            phone_val = extract_phone_from_text(raw_value)
+
+            # If no phone pattern, but value is short and numeric, still consider it
+            if not phone_val:
+                cleaned = re.sub(r"[^\d\+\-\(\)\s]", "", raw_value)
+                if 7 <= len(re.sub(r"\D", "", cleaned)) <= 15:
+                    phone_val = cleaned
+
+            if not phone_val:
+                logger.warning(f"Value near label is not a valid phone: '{raw_value}'")
+                return self._build_empty_phone_result(key_field)
+
+            # Step 4: Return structured result
+            bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+            conf = float(value_entity.get("confidence", 0.9))
+            return self._build_phone_result(
+                key_field, phone_val, bbox, conf, value_entity,
+                method="model_based_key_value",
+                meta={"label_entity": label_entity.get("value", ""), "raw_value": raw_value}
+            )
+
+        if self._is_email_label(key_field):
+            logger.info(f"Using enhanced email extraction for key_field: '{key_field}'")
+            
+            # Step 1: Find the email label entity
+            label_entity = self._find_label_entity(entities, key_field)
+            if not label_entity:
+                logger.warning(f"No label found for email field: '{key_field}'")
+                
+                # Aggressive fallback 1: Search for email pattern anywhere in document
+                global_email_candidates = []
+                for e in entities:
+                    value = e.get("value", "").strip()
+                    if not value:
+                        continue
+                    
+                    email_val = self._extract_email(value)
+                    if email_val and self._is_valid_email_format(email_val):
+                        confidence = float(e.get("confidence", 0.7))
+                        global_email_candidates.append((confidence, email_val, e))
+                
+                if global_email_candidates:
+                    # Pick the most confident candidate
+                    global_email_candidates.sort(key=lambda x: x[0], reverse=True)
+                    best_confidence, best_email, best_entity = global_email_candidates[0]
+                    logger.info(f"Found email via global search: '{best_email}' (confidence={best_confidence:.2f})")
+                    bbox = best_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                    return self._build_email_result(key_field, best_email, bbox, best_confidence, best_entity, method="global_search")
+                
+                # Aggressive fallback 2: Look for common email patterns in likely positions
+                for e in entities:
+                    value = e.get("value", "").strip().lower()
+                    if not value:
+                        continue
+                    
+                    # Look for patterns like "email: kc@imimr.net" or "e-mail address: kc@imimr.net"
+                    if any(pattern in value for pattern in ["email:", "e-mail:", "email address:", "e-mail address:"]):
+                        # Extract the part after the colon
+                        parts = value.split(":")
+                        if len(parts) > 1:
+                            potential_email = parts[1].strip()
+                            email_val = self._extract_email(potential_email)
+                            if email_val and self._is_valid_email_format(email_val):
+                                bbox = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                                conf = float(e.get("confidence", 0.8))
+                                logger.info(f"Found email via pattern search: '{email_val}'")
+                                return self._build_email_result(key_field, email_val, bbox, conf, e, method="pattern_search")
+                
+                logger.warning("No email found after all fallback attempts")
+                return self._build_empty_email_result(key_field)
+
+            # Step 2: Find value entity with GENEROUS spatial matching
+            value_entity = self._find_value_entity_with_generous_bounds(entities, label_entity, key_field)
+            
+            # Step 3: If direct spatial search fails, try value-first approach
+            if not value_entity:
+                logger.warning(f"Spatial search failed for email field '{key_field}', trying value-first approach")
+                value_entity = self._find_email_value_first(entities, key_field)
+            
+            # Step 4: If still no value, try aggressive search around label area
+            if not value_entity:
+                logger.warning(f"Value-first failed, trying aggressive area search around label")
+                value_entity = self._find_email_in_label_area(entities, label_entity)
+            
+            if not value_entity:
+                logger.warning(f"Label found but no valid email value for: '{key_field}'")
+                return self._build_empty_email_result(key_field)
+
+            # Step 5: Extract and validate email
+            raw_value = value_entity.get("value", "").strip()
+            email_val = self._extract_email(raw_value)
+            
+            # Fallback: Check nearby entities if direct extraction fails
+            if not email_val:
+                logger.warning(f"No email pattern in direct value: '{raw_value}', checking nearby entities")
+                nearby_entities = self._get_nearby_entities(entities, value_entity, max_distance=100)
+                for nearby_entity in nearby_entities:
+                    nearby_value = nearby_entity.get("value", "").strip()
+                    nearby_email = self._extract_email(nearby_value)
+                    if nearby_email and self._is_valid_email_format(nearby_email):
+                        logger.info(f"Found email in nearby entity: '{nearby_email}'")
+                        email_val = nearby_email
+                        value_entity = nearby_entity
+                        raw_value = nearby_value
+                        break
+            
+            if not email_val:
+                logger.warning(f"No email pattern found near label: '{raw_value}'")
+                return self._build_empty_email_result(key_field)
+
+            if not self._is_valid_email_format(email_val):
+                logger.warning(f"Invalid email format: '{email_val}'")
+                return self._build_empty_email_result(key_field)
+
+            # Step 6: Return structured result with proper "found" flag
+            bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+            conf = float(value_entity.get("confidence", 0.9))
+            
+            # FIXED: Only mark as "found" if we actually found a valid email
+            result, filtered_entities = self._build_email_result(
+                key_field, email_val, bbox, conf, value_entity,
+                method="model_based_key_value",
+                meta={"label_entity": label_entity.get("value", ""), "raw_value": raw_value}
+            )
+            
+            # Ensure proper "found" flag in result structure
+            if email_val != "Not found" and self._is_valid_email_format(email_val):
+                if isinstance(result, dict):
+                    result["found"] = True
+                if filtered_entities and isinstance(filtered_entities[0], dict):
+                    filtered_entities[0]["found"] = True
+            
+            return result, filtered_entities
+
+        # Get field type for validation
+        field_type = self._get_field_type(key_field)
         
-        for e in entities:
-            if e.get("value", "").strip() and len(e.get("value", "").strip()) > 3:
-                value_text = e.get("value", "").strip()
-                if not any(marker in value_text.lower() for marker in [":", ":", "：", "is", "are", "the"]):
-                    logger.info(f"Fallback: using entity as value: '{value_text}'")
-                    bbox = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                    conf = float(e.get("confidence", 0.9))
+        # SPECIAL HANDLING for name/organization field
+        if "name" in key_field_clean and ("organization" in key_field_clean or "owner" in key_field_clean):
+            logger.info(f"SPECIAL HANDLING for name/organization field: '{key_field}'")
+            
+            # Try to find the label first
+            label_entity = self._find_label_entity(entities, key_field)
+            
+            if label_entity:
+                logger.info(f"Found label for '{key_field}': '{label_entity.get('value', '')}'")
+                
+                # Use improved search for values near this label
+                value_entity = self._find_value_near_label(entities, label_entity, key_field, field_type)
+                
+                if value_entity:
+                    value_text = value_entity.get("value", "").strip()
+                    bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                    conf = float(value_entity.get("confidence", 0.9))
+                    
+                    # Clean value
+                    cleaned_value = self._clean_field_value(value_text, field_type)
+                    
                     result = {
                         "field_name": key_field,
-                        "value": value_text,
+                        "value": cleaned_value,
                         "structured_value": {
                             "field_name": key_field,
-                            "field_type": "text",
-                            "value": value_text,
+                            "field_type": field_type,
+                            "value": cleaned_value,
                             "confidence": conf,
                             "bbox": bbox,
                         },
                         "confidence": conf,
                         "bbox": bbox,
                         "context_entities": [],
-                        "extraction_method": "fallback_value",
-                        "meta": {"note": "Label not found, using fallback value"},
+                        "extraction_method": "special_name_organization_detection",
+                        "meta": {
+                            "label_entity": label_entity.get("value", ""),
+                            "label_confidence": label_entity.get("confidence", 0),
+                        },
                     }
-                    filtered_entities = [
-                        {
-                            "field": key_field,
-                            "value": value_text,
-                            "bbox": bbox,
+                    filtered_entity = {
+                        "field": key_field,
+                        "value": cleaned_value,
+                        "bbox": bbox,
+                        "confidence": conf,
+                        "page_number": value_entity.get("page_number", 1),
+                        "semantic_type": EntityTypes.ANSWER,
+                        "semantic_confidence": conf,
+                    }
+                    return result, [filtered_entity]
+                else:
+                    logger.warning(f"Label found but no value found for: '{key_field}'")
+            else:
+                logger.warning(f"No label found for: '{key_field}'")
+
+        # === STEP 1: PRIMARY EXTRACTION USING LILT MODEL ===
+        if self.lilt_extractor and self.lilt_extractor.is_available():
+            try:
+                relations = self.lilt_extractor.extract_relations(entities)
+                logger.info(f"LiLT found {len(relations)} relations")
+                
+                # Get field-specific patterns
+                patterns = self._get_field_patterns(key_field)
+                
+                # Find best matching relation with field-type awareness
+                best_relation = None
+                best_score = 0
+                
+                for rel in relations:
+                    label_text = rel.get("label_text", "").lower()
+                    value_text = rel.get("value_text", "").strip()
+                    
+                    # Semantic score based on pattern matching
+                    pattern_score = sum(1 for p in patterns if p in label_text) / max(1, len(patterns))
+                    
+                    # Field-type validation score
+                    validation_score = 1.0 if self._validate_field_value(value_text, field_type) else 0.2
+                    
+                    # Spatial score (lower distance = higher score)
+                    spatial_score = 1.0 / (1.0 + rel.get("distance", 100))
+                    
+                    # Combined score
+                    total_score = pattern_score * 0.5 + validation_score * 0.3 + spatial_score * 0.2
+                    
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_relation = rel
+                
+                if best_relation and best_score > 0.45:
+                    logger.info(f"LiLT found matching relation with score {best_score:.2f} for field '{key_field}'")
+                    value_text = best_relation.get("value_text", "Not found")
+                    bbox = best_relation.get("value_bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                    conf = float(best_relation.get("confidence", 0.8))
+                    
+                    # Clean value based on field type
+                    cleaned_value = self._clean_field_value(value_text, field_type)
+                    
+                    result = {
+                        "field_name": key_field,
+                        "value": cleaned_value,
+                        "structured_value": {
+                            "field_name": key_field,
+                            "field_type": field_type,
+                            "value": cleaned_value,
                             "confidence": conf,
-                            "page_number": e.get("page_number", 1),
-                            "semantic_type": EntityTypes.ANSWER,
-                            "semantic_confidence": conf,
-                        }
-                    ]
-                    return result, filtered_entities
+                            "bbox": bbox,
+                        },
+                        "confidence": conf,
+                        "bbox": bbox,
+                        "context_entities": [],
+                        "extraction_method": "lilt_relation_extraction",
+                        "meta": {
+                            "relation_score": best_score,
+                            "label_text": best_relation.get("label_text", ""),
+                            "value_text": best_relation.get("value_text", ""),
+                            "model_used": True,
+                        },
+                    }
+                    filtered_entity = {
+                        "field": key_field,
+                        "value": cleaned_value,
+                        "bbox": bbox,
+                        "confidence": conf,
+                        "page_number": best_relation.get("page_number", 1),
+                        "semantic_type": EntityTypes.ANSWER,
+                        "semantic_confidence": conf,
+                    }
+                    return result, [filtered_entity]
+                
+                logger.info(f"LiLT relations didn't match well for '{key_field}' (best score: {best_score:.2f})")
+            
+            except Exception as e:
+                logger.warning(f"LiLT relation extraction failed for '{key_field}': {e}")
         
-        logger.warning(f"No value found for: {key_field}")
-        empty_result = {
-            "field_name": key_field,
-            "value": "Not found",
-            "structured_value": {
+        # === STEP 2: PATTERN-BASED FALLBACK WITH STRICT VALIDATION ===
+        logger.info(f"Fallback to pattern-based detection for: '{key_field}'")
+        
+        # Get field-specific patterns
+        patterns = self._get_field_patterns(key_field)
+        
+        # Find label entity using patterns
+        label_entity = None
+        for e in entities:
+            text = e.get("value", "").lower()
+            for pat in patterns:
+                if re.search(pat, text, re.IGNORECASE):
+                    label_entity = e
+                    logger.info(f"Found label via pattern '{pat}' for '{key_field}': '{e.get('value', '')}'")
+                    break
+            if label_entity:
+                break
+        
+        # Find value entity with field-type awareness
+        value_entity = None
+        if label_entity:
+            value_entity = self._find_value_for_label(entities, label_entity, key_field, field_type)
+        
+        # If no label found, try value-first approach with strict validation
+        if not label_entity or not value_entity:
+            logger.info("Label/value not found; trying value-first approach with validation")
+            value_entity = self._find_value_by_pattern(entities, key_field, field_type)
+        
+        # Build result with validation
+        if value_entity:
+            value_text = value_entity.get("value", "").strip()
+            bbox = value_entity.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+            conf = float(value_entity.get("confidence", 0.8))
+            
+            # Clean and validate value
+            cleaned_value = self._clean_field_value(value_text, field_type)
+            
+            if not self._validate_field_value(cleaned_value, field_type):
+                logger.warning(f"Value failed validation for field type '{field_type}' ({key_field}): '{cleaned_value}'")
+                # Try to find better match with stricter validation
+                return self._find_alternative_value(entities, key_field, field_type)
+            
+            result = {
                 "field_name": key_field,
-                "field_type": "text",
-                "value": "Not found",
-                "confidence": 0.0,
-                "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
-            },
-            "confidence": 0.0,
-            "bbox": {"x": 0, "y": 0, "width": 1, "height": 1},
-            "context_entities": [],
-            "extraction_method": "none",
-            "meta": {"reason": "No matching value found"},
-        }
-        return empty_result, []
+                "value": cleaned_value,
+                "structured_value": {
+                    "field_name": key_field,
+                    "field_type": field_type,
+                    "value": cleaned_value,
+                    "confidence": conf,
+                    "bbox": bbox,
+                },
+                "confidence": conf,
+                "bbox": bbox,
+                "context_entities": [],
+                "extraction_method": "pattern_based_fallback",
+                "meta": {
+                    "label_entity": label_entity.get("value", "") if label_entity else None,
+                    "method": "value_first" if not label_entity else "label_value_pair",
+                },
+            }
+            filtered_entity = {
+                "field": key_field,
+                "value": cleaned_value,
+                "bbox": bbox,
+                "confidence": conf,
+                "page_number": value_entity.get("page_number", 1),
+                "semantic_type": EntityTypes.ANSWER,
+                "semantic_confidence": conf,
+            }
+            return result, [filtered_entity]
+        
+        # === STEP 3: ULTIMATE FALLBACK - EMPTY RESULT ===
+        logger.warning(f"No valid value found for field: '{key_field}'")
+        return self._build_empty_result(key_field)
+
+    def _get_field_type(self, key_field: str) -> str:
+        """Map field names to semantic types for validation"""
+        key_lower = key_field.lower()
+        
+        if any(term in key_lower for term in ["registration number", "reg no", "registration no"]):
+            return "registration_number"
+        elif any(term in key_lower for term in ["application number", "app no", "application no", "fit scheme application"]):
+            return "application_number"
+        elif any(term in key_lower for term in ["form number", "form no", "reference no"]):
+            return "form_number"
+        elif any(term in key_lower for term in ["correspondence address", "contact address", "mailing address"]):
+            return "address"
+        elif any(term in key_lower for term in ["issue date", "completion date", "date of"]):
+            return "date"
+        elif any(term in key_lower for term in ["name", "organization", "owner", "applicant"]):
+            return "person_name"
+        elif any(term in key_lower for term in ["phone", "tel", "telephone", "contact tel"]):
+            return "phone"
+        elif "email" in key_lower:
+            return "email"
+        
+        return "text"
+
+    def _get_field_patterns(self, key_field: str) -> List[str]:
+        """Get patterns for field matching based on field name"""
+        key_lower = key_field.lower()
+        
+        # SPECIFIC FIX for "Name Or Organization Of The Owner Of The Generating Facility"
+        if "name" in key_lower and ("organization" in key_lower or "owner" in key_lower):
+            # Enhanced patterns for owner name field - BOTH English and Chinese
+            return [
+                # English patterns
+                r"name.*organization.*owner.*generating.*facility",
+                r"owner.*name.*organization",
+                r"name.*or.*organization.*owner",
+                r"name.*of.*owner",
+                r"owner.*name.*of.*generating.*facility",
+                
+                # Chinese patterns (from your screenshot)
+                r"發電設施擁有人的姓名或公司名稱",
+                r"設施擁有人的姓名",
+                r"姓名或公司名稱",
+                r"擁有人的姓名",
+                r"發電設施.*姓名.*公司名稱",
+                r"姓名.*公司名稱.*發電設施",
+                
+                # Bilingual combination patterns
+                r"name.*or.*organization.*發電設施",
+                r"owner.*姓名.*公司名稱",
+                
+                # Numeric pattern (for "1." in front of the label)
+                r"1\..*姓名.*公司名稱",
+                r"1\..*name.*organization",
+                
+                # Generic patterns that might match partial text
+                r"姓名或公司名稱",
+                r"name.*organization",
+                r"owner.*name"
+            ]
+
+        if "registration number" in key_lower:
+            return [r"registration\s+number", r"reg\s+no", r"no\s*:\s*ad_\d+", r"ad_\d+",
+                    r"registration\s+no", r"registration\s+of"]
+        elif "application number" in key_lower or "application no" in key_lower:
+            return [r"application\s+no", r"application\s+number", r"app\s+no", r"no\s*:\s*pp-\d+",
+                    r"fit\s+scheme\s+application", r"power\s+supply\s+company"]
+        elif "correspondence address" in key_lower:
+            return [r"correspondence\s+address", r"contact\s+address", r"mailing\s+address",
+                    r"address\s+of\s+the\s+owner"]
+        elif "name" in key_lower and ("organization" in key_lower or "owner" in key_lower):
+            return [r"name.*organization", r"owner.*name", r"applicant", r"organisation"]
+        
+        # Default patterns
+        words = re.findall(r'\w+', key_lower)
+        patterns = []
+        if len(words) > 1:
+            patterns.append(r".*" + r".*".join(words) + r".*")
+        patterns.append(r".*" + words[-1] + r".*")
+        return patterns
+
+    def _is_instructional_or_header_text(self, text: str) -> bool:
+        """Identify instructional text, headers, and non-value content to skip entirely"""
+        if not text or len(text.strip()) < 3:
+            return False
+        
+        text_lower = text.lower().strip()
+        
+        # Skip all instructional text patterns (both English and Chinese)
+        skip_patterns = [
+            # Chinese instructional patterns
+            r"更改\s*註冊\s*發電\s*設施\s*資料",  # The problematic text
+            r"申請\s*更改", r"更正\s*資料", r"變更\s*登記",
+            r"機電\s*工程\s*署", r"必\s*須\s*填\s*寫", r"請\s*在\s*適\s*當\s*空\s*格\s*加",
+            r"只\s*可\s*選\s*擇\s*一\s*項", r"並\s*加\s*上", r"符\s*號",
+            r"發\s*電\s*設\s*施\s*擁\s*有\s*人", r"的\s*姓\s*名\s*或\s*公\s*司\s*名\s*稱",
+            
+            # English instructional patterns  
+            r"change\s+registered\s+power\s+generation\s+facility\s+data",
+            r"please\s+tick", r"tick\s+the\s+appropriate", r"only\s+one\s+allowed",
+            r"fill\s+in\s+block\s+letters", r"applicant\s+should\s+complete",
+            r"before\s+you\s+complete", r"read\s+carefully\s+the\s+notes",
+        ]
+        
+        # Skip section headers and form titles
+        section_headers = [
+            r"section\s+a", r"section\s+b", r"part\s+a", r"part\s+b",
+            r"a\s+部", r"b\s+部", r"一\s+般\s+資\s*料", r"申\s*請\s*人\s*資\s*料",
+            r"form\s+gf2", r"application\s+form", r"renewable\s+energy",
+        ]
+        
+        # Skip all patterns
+        for pattern in skip_patterns + section_headers:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        
+        return False
+
+    def _find_value_for_label(self, entities: List[Dict], label_entity: Dict, key_field: str, field_type: str) -> Optional[Dict]:
+        """Find value entity with LiLT-aware spatial analysis and field-type validation"""
+        label_bbox = label_entity.get("bbox", {})
+        label_page = label_entity.get("page_number", 1)
+        label_x = label_bbox.get("x", 0)
+        label_y = label_bbox.get("y", 0)
+        label_width = label_bbox.get("width", 0)
+        label_height = label_bbox.get("height", 0)
+        label_center_y = label_y + label_height / 2
+        
+        candidates = []
+        
+        for e in entities:
+            if e is label_entity or e.get("page_number", 1) != label_page:
+                continue
+                
+            e_bbox = e.get("bbox", {})
+            e_x = e_bbox.get("x", 0)
+            e_y = e_bbox.get("y", 0)
+            e_width = e_bbox.get("width", 0)
+            e_height = e_bbox.get("height", 0)
+            e_center_y = e_y + e_height / 2
+
+            # SKIP INSTRUCTIONAL/HEADER TEXT COMPLETELY
+            value = e.get("value", "")
+            if self._is_instructional_or_header_text(value):
+                logger.debug(f"Skipping instructional text: '{value}'")
+                continue
+
+            # Skip likely labels
+            if self._is_label_candidate(e.get("value", "")):
+                continue
+            
+            # Calculate spatial relationships - PRIORITIZE RIGHT AND BELOW
+            horizontal_dist = e_x - (label_x + label_width)
+            vertical_dist = abs(e_center_y - label_center_y)
+            
+            # Directional preference (right of label is best, below is acceptable)
+            is_to_right = horizontal_dist > -50 and horizontal_dist < 300
+            is_below = e_y > label_y + label_height * 0.8 and abs(e_x - label_x) < label_width * 2.0
+            
+            if not (is_to_right or is_below):
+                continue
+            
+            # For owner name specifically, be more restrictive
+            if "owner" in key_field.lower() or "name" in key_field.lower():
+                # Must be within reasonable vertical range (not too far below)
+                vertical_gap = abs(e_y - (label_y + label_height))
+                if vertical_gap > 200:  # Max 200px below
+                    continue
+                
+                # Must be reasonably aligned horizontally
+                horizontal_gap = abs(e_x - label_x)
+                if horizontal_gap > 300:  # Max 300px horizontal shift
+                    continue
+
+            # Score based on position and field type
+            score = 0.0
+            if is_to_right:
+                # Higher score for values on the same line
+                vertical_penalty = min(1.0, vertical_dist / (label_height * 1.5))
+                horizontal_penalty = min(1.0, horizontal_dist / 300)
+                score = 1.0 - (vertical_penalty * 0.7 + horizontal_penalty * 0.3)
+            elif is_below:
+                # Lower score for values below the label
+                vertical_penalty = min(1.0, (e_y - (label_y + label_height)) / 200)
+                horizontal_penalty = min(1.0, abs(e_x - label_x) / (label_width * 1.5))
+                score = 0.8 - (vertical_penalty * 0.6 + horizontal_penalty * 0.4)
+            
+            # Boost for field-type match
+            value_text = e.get("value", "").strip()
+            if self._validate_field_value(value_text, field_type):
+                score += 0.3
+            
+            if score > 0.3:
+                candidates.append({
+                    "entity": e,
+                    "score": score,
+                    "horizontal_dist": horizontal_dist,
+                    "vertical_dist": vertical_dist,
+                    "position": "right" if is_to_right else "below",
+                    "field_type_match": self._validate_field_value(value_text, field_type)
+                })
+        
+        if not candidates:
+            return None
+        
+        # Sort by score and return best match
+        best_candidate = max(candidates, key=lambda x: x["score"])
+        logger.info(f"Selected value for '{key_field}': '{best_candidate['entity'].get('value', '')}' "
+                    f"(score={best_candidate['score']:.2f}, position={best_candidate['position']}, "
+                    f"field_type_match={best_candidate['field_type_match']})")
+        
+        return best_candidate["entity"]
+
+    def _validate_field_value(self, value: str, field_type: str) -> bool:
+        """Validate value based on field type with strict patterns"""
+        if not value or value.lower() in ["not found", "none", "n/a"]:
+            return False
+        
+        value_lower = value.lower()
+
+        # Registration number validation - accept patterns like "AD 1223"
+        if field_type == "registration_number":
+            # First check for valid patterns
+            registration_patterns = [
+                r'ad[-\s_]?[0-9]{3,5}',  # AD 1223, AD-1223, AD_ r'reg[-\s_]?no[-\s_]?[0-9]+',  # REG NO  r'[0-9]+[-\s_]?ad',  # 1223 AD
+                r'[a-z]{2,3}[-\s_]?[0-9]{3,5}'  # General pattern
+            ]
+            
+            for pattern in registration_patterns:
+                if re.search(pattern, value_lower):
+                    return True
+            
+            # Fallback: check if it contains numbers and "ad" or "reg"
+            return ('ad' in value_lower or 'reg' in value_lower) and any(c.isdigit() for c in value_lower)
+       
+        if field_type == "application_number":
+            # Should match patterns like PP-2323190
+            return bool(re.search(r'pp[-_]?\d+', value_lower))
+        
+        if field_type == "form_number":
+            # Should match patterns like EMSD/EL/GF2(06/2024) but NOT be just a year
+            return bool(re.search(r'em\w+/[^/]+/gf\d+', value_lower)) and not bool(re.search(r'\(?\d{4}\)?', value_lower))
+        
+        if field_type == "address":
+            # Should contain address keywords and have comma or multiple parts
+            address_keywords = ["road", "street", "blvd", "ave", "unit", "floor", "tower", "building", "room", "level"]
+            has_keywords = any(keyword in value_lower for keyword in address_keywords)
+            has_structure = ',' in value or len(value.split()) >= 3
+            return has_keywords or has_structure
+        
+        # FIXED: More lenient validation for person/organization names
+        if field_type == "person_name":
+            # Accept any non-empty string that's not obviously invalid
+            # Don't require multiple words (single word names are valid)
+            has_content = len(value.strip()) >= 2
+            
+            # Reject obvious non-names (email patterns, URLs, etc.)
+            has_no_email_pattern = '@' not in value and not re.search(r'\.(com|org|net|gov|edu)$', value_lower)
+            has_no_url_pattern = 'http' not in value_lower and 'www.' not in value_lower
+            
+            # Don't reject based on "department" or "office" - these could be part of organization names
+            # But reject if it's clearly a header/instruction
+            is_not_instructional = not any(
+                pattern in value_lower for pattern in [
+                    "please", "tick", "select", "indicate", "mark",
+                    "section", "part", "form", "application", "confidential"
+                ]
+            )
+            
+            return has_content and has_no_email_pattern and has_no_url_pattern and is_not_instructional
+        
+        if field_type == "date":
+            # Should contain date patterns
+            return bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', value_lower))
+
+        if field_type == "email":
+            # Should have proper email format with valid domain
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            match = re.search(email_pattern, value_lower)
+            if not match:
+                return False
+            
+            # Validate domain is realistic
+            domain = match.group(0).split('@')[-1]
+            valid_domains = [".com", ".org", ".gov", ".edu", "net", ".hk", ".co"]
+            return any(domain.endswith(d) for d in valid_domains)
+       
+        # Default validation
+        return len(value) > 2 and not value.startswith(("<", "[", "{")) and not value.endswith((":", ":", "："))
+
+    def _find_value_by_pattern(self, entities: List[Dict], key_field: str, field_type: str) -> Optional[Dict]:
+        """Find value by matching against field-type patterns with positional awareness"""
+        candidates = []
+        
+        for e in entities:
+            value = e.get("value", "").strip()
+            if not value:
+                continue
+            
+            bbox = e.get("bbox", {})
+            # Prefer values from top to bottom (earlier in document)
+            y_position = bbox.get("y", 0)
+            position_score = 1.0 - (y_position / 3000)  # Prefer values near top
+            
+            # Score based on field-type validation
+            validation_match = self._validate_field_value(value, field_type)
+            validation_score = 0.8 if validation_match else 0.0
+            
+            # Additional score for field-specific keywords
+            keyword_score = 0.0
+            if field_type == "registration_number" and ("ad_" in value_lower or "reg" in value_lower):
+                keyword_score = 0.2
+            elif field_type == "application_number" and "pp-" in value_lower:
+                keyword_score = 0.2
+            elif field_type == "address" and any(k in value_lower for k in ["road", "street", "blvd"]):
+                keyword_score = 0.2
+            
+            total_score = validation_score + keyword_score + position_score * 0.2
+            
+            if total_score > 0.4:
+                candidates.append({
+                    "entity": e,
+                    "score": total_score,
+                    "validation_match": validation_match,
+                    "y_position": y_position
+                })
+        
+        if candidates:
+            best_candidate = max(candidates, key=lambda x: x["score"])
+            logger.info(f"Found value by pattern for '{key_field}': '{best_candidate['entity'].get('value', '')}' "
+                        f"(score={best_candidate['score']:.2f}, validation={best_candidate['validation_match']})")
+            return best_candidate["entity"]
+        
+        return None
+
+    def _is_label_candidate(self, text: str) -> bool:
+        """Check if text is likely a label rather than a value"""
+        if not text:
+            return False
+            
+        text_lower = text.lower().strip()
+        
+        # Skip entities with these patterns (likely labels)
+        label_patterns = [
+            r"^[a-z\s]{3,}:\s*$",  # "text:" pattern
+            r"^section\s+\w",
+            r"^part\s+\w",
+            r"^item\s+\w",
+            r"^table\s+\w",
+            r"^[A-Z\s]{3,}$",  # ALL CAPS headers
+            r"^\(?\d+\)?$",  # Numbered items like (1), 1., etc.
+            r"^tick\s+the",  # Instructions
+            r"^please\s+mark",  # Instructions
+            r"^select\s+one",  # Instructions
+        ]
+        
+        # Skip common header text
+        header_words = ["section", "part", "item", "page", "reference", "form", "document", "confidential"]
+        if any(word in text_lower for word in header_words):
+            return True
+        
+        return any(re.search(pattern, text_lower) for pattern in label_patterns)
+
+    def _clean_field_value(self, value: str, field_type: str) -> str:
+        """Clean field value based on field type"""
+        if not value:
+            return value
+            
+        value = value.strip()
+        
+        if field_type in ["registration_number", "application_number", "form_number"]:
+            # Extract only the identifier part with proper formatting
+            match = re.search(r'([A-Z]{2,3}[-_]?\d+)', value)
+            if match:
+                return match.group(0)
+            
+            # For form numbers with complex patterns
+            if field_type == "form_number":
+                match = re.search(r'(EMSD/[^/]+/GF\d+)(?:\s*\(\d{2}/\d{4}\))?', value)
+                if match:
+                    return match.group(1)
+        
+        if field_type == "date":
+            # Standardize date format
+            match = re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', value)
+            if match:
+                return match.group(0)
+        
+        if field_type == "email":
+            # Clean and extract only valid email part
+            match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', value.lower())
+            if match:
+                return match.group(0)
+        
+        # Remove leading/trailing punctuation and whitespace
+        return re.sub(r'^[:\-.,\s]+|[:\-.,\s]+$', '', value)
+
+    def _find_alternative_value(self, entities: List[Dict], key_field: str, field_type: str) -> Tuple[Dict, List[Dict]]:
+        """Find alternative value when primary candidate fails validation"""
+        logger.info(f"Searching for alternative value for field: '{key_field}'")
+        
+        candidates = []
+        for e in entities:
+            value = e.get("value", "").strip()
+            if not value:
+                continue
+            
+            # Prioritize entities with higher confidence
+            score = float(e.get("confidence", 0.5))
+            
+            # Boost score if value matches field patterns
+            if self._validate_field_value(value, field_type):
+                score += 0.5
+            
+            candidates.append((score, e))
+        
+        if candidates:
+            best_candidate = max(candidates, key=lambda x: x[0])[1]
+            value_text = best_candidate.get("value", "").strip()
+            bbox = best_candidate.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+            conf = float(best_candidate.get("confidence", 0.8))
+            
+            cleaned_value = self._clean_field_value(value_text, field_type)
+            
+            result = {
+                "field_name": key_field,
+                "value": cleaned_value,
+                "structured_value": {
+                    "field_name": key_field,
+                    "field_type": field_type,
+                    "value": cleaned_value,
+                    "confidence": conf,
+                    "bbox": bbox,
+                },
+                "confidence": conf,
+                "bbox": bbox,
+                "context_entities": [],
+                "extraction_method": "alternative_value_search",
+                "meta": {
+                    "reason": "Primary candidate failed validation",
+                    "fallback_used": True,
+                },
+            }
+            filtered_entity = {
+                "field": key_field,
+                "value": cleaned_value,
+                "bbox": bbox,
+                "confidence": conf,
+                "page_number": best_candidate.get("page_number", 1),
+                "semantic_type": EntityTypes.ANSWER,
+                "semantic_confidence": conf,
+            }
+            return result, [filtered_entity]
+        
+        return self._build_empty_result(key_field)
 
 # ------- Document Analyzer -------
 class DocumentAnalyzer:
@@ -2205,9 +4369,17 @@ class DocumentAnalyzer:
         self, file_path: str, key_field: Optional[str], language_input: Optional[str]
     ) -> Dict[str, Any]:
         start_time = time.time()
+        
+        # Clear GPU cache before starting
+        if torch and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         langs_norm = _validate_and_normalize_langs(language_input)
         logger.info(f"Analyzing file with languages: {langs_norm}")
-        entities, full_text, page_count, _ = _extract_text_multipage(
+
+        langs_norm = _validate_and_normalize_langs(language_input)
+        logger.info(f"Analyzing file with languages: {langs_norm}")
+        entities, page_count, _ = _extract_text_multipage(
             file_path, languages=langs_norm, conf_threshold=0.05
         )
         kf_result = None
@@ -2227,7 +4399,7 @@ class DocumentAnalyzer:
             "total_entities": len(filtered_entities),
             "entities": filtered_entities,
             "key_field_result": kf_result,
-            "full_text": full_text,
+            "full_text": "", #full_text,
             "processing_time": processing_time,
             "language_used": langs_norm,
             "model_used": self.lilt_extractor is not None
@@ -2367,7 +4539,7 @@ def _build_result_json_payload(
             "pages": 1
         }
     }
-    
+
     # Build lookup map
     result_map = {r.key_field: r for r in results}
     logger.info(f"Building result.json for {len(key_fields)} key fields")
@@ -2504,6 +4676,275 @@ def map_form_display(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> 
     # No match: return original
     return raw_form_name, "Unknown"
 
+@app.post("/api/get_analysis_result")
+async def get_analysis_result(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """
+    Combined endpoint - RETURNS ONLY result.json content directly
+    """
+    tmp_path = None
+    document_width = 0
+    document_height = 0
+    try:
+        if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
+            raise HTTPException(503, "Analyzer not initialized")
+        if not hasattr(app.state, "verifier") or app.state.verifier is None:
+            raise HTTPException(503, "Verifier not initialized")
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
+            raise HTTPException(400, "Unsupported file type")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            content = await file.read()
+            if not content:
+                raise HTTPException(400, "Empty file")
+            tf.write(content)
+            tmp_path = tf.name
+        # Get document dimensions
+        try:
+            ext = os.path.splitext(file.filename)[1].lower()
+            if ext == ".pdf":
+                if not PDF2IMAGE_AVAILABLE:
+                    raise RuntimeError("pdf2image not available")
+                poppler_path = os.environ.get("POPPLER_PATH")
+                kwargs = {"poppler_path": poppler_path} if poppler_path else {}
+                images = convert_from_path(tmp_path, dpi=300, **kwargs)
+                for page_idx, img in enumerate(images):
+                    page_num = page_idx + 1
+                    img_width, img_height = img.size  # 🚨 CRITICAL: PAGE DIMENSIONS
+                    document_width, document_height = img.size
+            else:
+                # Image handling with Pillow
+                img = Image.open(tmp_path).convert("RGB")
+                img = ImageOps.exif_transpose(img)
+                document_width, document_height = img.size
+            logger.info(f"Document: {document_width}x{document_height}")
+        except Exception as e:
+            logger.warning(f"Dimension extraction failed ({e}), using default")
+            document_width, document_height = 1654, 2339
+
+        langs_norm = _validate_and_normalize_langs(language)
+        analyzer = app.state.analyzer
+        verifier = app.state.verifier
+
+        v_res = None
+        try:           
+            v_res = verifier.verify(tmp_path)  
+           
+            # First, get first page image for processing
+            processed_path = verifier._get_first_page_image(tmp_path)
+            if not processed_path:
+                return JSONResponse({
+                    "error": "Failed to process file for form name extraction",
+                    "filename": file.filename
+                }, status_code=400)
+
+            try:
+                # Extract OCR text and boxes
+                words, boxes, w, h = ocr_extract_words_bboxes(processed_path)
+                query_fp = generate_fingerprint(words, boxes, w, h)
+
+                # Find best matching fingerprint
+                best_fp = None
+                best_score = 0.0
+
+                for fname, fp in verifier.fingerprints.items():
+                    try:
+                        score = fingerprint_similarity(query_fp, fp)
+                    except Exception:
+                        continue
+
+                    if score > best_score:
+                        best_score = score
+                        best_fp = fname
+                
+            finally:
+                # Clean up temporary processed image if different from original
+                if processed_path != tmp_path and os.path.exists(processed_path):
+                    try:
+                        os.remove(processed_path)
+                    except Exception:
+                        pass
+                        
+        except Exception as e:
+            logger.exception(f"Form name extraction failed: {e}")
+            return JSONResponse({
+                "error": f"Form name extraction failed: {str(e)}",
+                "filename": file.filename
+            }, status_code=500)
+            
+        finally:
+            # Clean up original temporary file
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        # Load key_fields from key_field.txt
+        key_fields: List[str] = []
+        try:
+            with open("key_field.txt", "r", encoding="utf-8") as f:
+                key_fields = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            logger.warning("key_field.txt not found")
+            key_fields = []
+        results: List[MultiKeyFieldResult] = []
+        # Analyze each key_field
+        for kf in key_fields:
+            try:
+                raw_result = analyzer.analyze_file(tmp_path, kf, language_input=langs_norm)
+                # Convert entities (for API response)
+                entities_model = []
+                for e in raw_result.get("entities", []):
+                    try:
+                        bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                        entities_model.append(ExtractedEntity(
+                            field=e.get("field", ""),
+                            value=e.get("value", ""),
+                            bbox=BoundingBox(**bbox_data),
+                            confidence=float(e.get("confidence", 0.0)),
+                            page_number=int(e.get("page_number", 1))
+                        ))
+                    except Exception:
+                        continue
+                # Convert key_field_result
+                kfr_model = None
+                if raw_result.get("key_field_result"):
+                    kf_res = raw_result["key_field_result"]
+                    try:
+                        if isinstance(kf_res, list):
+                            # Multiple individual checkbox results
+                            kfr_list = []
+                            for res in kf_res:
+                                try:
+                                    bbox_data = res.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                                    page_num = int(res.get("page_number", 1))
+                                    # Create DataField for structured_value
+                                    structured_value = None
+                                    if res.get("structured_value"):
+                                        sv = res["structured_value"]
+                                        structured_value = DataField(
+                                            field_name=sv.get("field_name", res.get("field_name", "")),
+                                            field_type=sv.get("field_type", "individual_checkbox"),
+                                            value=sv.get("value", ""),
+                                            confidence=float(sv.get("confidence", 0.0)),
+                                            bbox=BoundingBox(**sv.get("bbox", bbox_data))
+                                        )
+                                    
+                                    kfr_list.append(KeyFieldResult(
+                                        field_name=res.get("field_name", ""),
+                                        value=res.get("value", ""),
+                                        structured_value=structured_value,
+                                        confidence=float(res.get("confidence", 0.0)),
+                                        bbox=BoundingBox(**bbox_data),
+                                        page_number=page_num,
+                                        meta=res.get("meta"),
+                                        extraction_method=res.get("extraction_method")
+                                    ))
+                                except Exception as e:
+                                    logger.warning(f"Individual checkbox conversion failed: {e}")
+                                    continue
+                            kfr_model = kfr_list
+                        else:
+                            # Single result
+                            bbox_data = kf_res.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                            page_num = int(kf_res.get("page_number", 1))
+                            # Create DataField for structured_value
+                            structured_value = None
+                            if kf_res.get("structured_value"):
+                                sv = kf_res["structured_value"]
+                                structured_value = DataField(
+                                    field_name=sv.get("field_name", kf_res.get("field_name", "")),
+                                    field_type=sv.get("field_type", "text"),
+                                    value=sv.get("value", ""),
+                                    confidence=float(sv.get("confidence", 0.0)),
+                                    bbox=BoundingBox(**sv.get("bbox", bbox_data))
+                                )
+                            
+                            kfr_model = KeyFieldResult(
+                                field_name=kf_res.get("field_name", ""),
+                                value=kf_res.get("value", ""),
+                                structured_value=structured_value,
+                                confidence=float(kf_res.get("confidence", 0.0)),
+                                bbox=BoundingBox(**bbox_data),
+                                page_number=page_num,
+                                meta=kf_res.get("meta"),
+                                extraction_method=kf_res.get("extraction_method")
+                            )
+                    except Exception as e:
+                        logger.warning(f"Key field result conversion failed: {e}")
+                        kfr_model = None
+                extraction = ExtractionResult(
+                    document_name=file.filename,
+                    page_count=raw_result.get("page_count", 1),
+                    total_entities=len(entities_model),
+                    entities=entities_model,
+                    key_field_result=kfr_model,
+                    full_text_snippet=raw_result.get("full_text", "")[:1000],
+                    processing_time=float(raw_result.get("processing_time", 0.0)),
+                    language_used=langs_norm,
+                    model_used=raw_result.get("model_used", False)
+                )
+                results.append(MultiKeyFieldResult(key_field=kf, extraction=extraction))
+            except Exception as e:
+                results.append(MultiKeyFieldResult(key_field=kf, error=str(e)))
+        # Run verifier
+        verification_result = None
+        try:
+            #v_res = verifier.verify(tmp_path)  
+            raw_form_name = v_res.get("form_name", "Unknown")
+            mapped_form_name, mapped_classication_type = map_form_display(raw_form_name)
+            verification_result = VerificationResult(
+                filename=v_res.get("filename", file.filename),
+                predicted_class=v_res.get("predicted_class", "Unknown"),
+                confidence=float(v_res.get("confidence", 0.0)),
+                form_name=mapped_form_name,  # ✅ mapped via CSV
+                classification_type=best_fp,
+                in_training_data=bool(v_res.get("in_training_data", False)),
+                training_similarity=float(v_res.get("training_similarity", 0.0)),
+                training_info=v_res.get("training_info", ""),
+                extracted_text_preview=v_res.get("extracted_text_preview", ""),
+                processing_time=float(v_res.get("processing_time", 0.0)),
+                method=v_res.get("method", "hybrid")
+            )
+        except Exception as e:
+            logger.exception("Verification failed")
+        # BUILD result.json and RETURN IT DIRECTLY
+        result_json_content = _build_result_json_payload(
+            key_fields=key_fields,
+            results=results,
+            verification_result=verification_result,
+            document_width=document_width,
+            document_height=document_height
+        )
+        # Save to disk
+        try:
+            with open("result.json", "w", encoding="utf-8") as f:
+                json.dump(result_json_content, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved result.json: {result_json_content['stats']['found']}/{len(key_fields)}")
+        except Exception as e:
+            logger.warning(f"result.json save failed: {e}")
+        # RETURN ONLY result.json_content
+        return result_json_content
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception("get_data_api error")
+        return {
+            "status": "error",
+            "message": "internal error",
+            "form_name": None,
+            "fields": [],
+            "stats": {"found": 0, "missing": 0, "pages": 1}
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 @app.post("/api/get_data")
 async def get_data_api(
     file: UploadFile = File(...),
@@ -2552,19 +4993,16 @@ async def get_data_api(
             logger.warning(f"Dimension extraction failed ({e}), using default")
             document_width, document_height = 1654, 2339
 
-        OUTPUT_FILE = "extracted_fields.txt"   # <-- Output file
-        success = run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
-
         langs_norm = _validate_and_normalize_langs(language)
         analyzer = app.state.analyzer
         verifier = app.state.verifier
         # Load key_fields from key_field.txt
         key_fields: List[str] = []
         try:
-            with open("extracted_fields.txt", "r", encoding="utf-8") as f:
+            with open("key_field.txt", "r", encoding="utf-8") as f:
                 key_fields = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
-            logger.warning("extracted_fields.txt not found")
+            logger.warning("key_field.txt not found")
             key_fields = []
         results: List[MultiKeyFieldResult] = []
         # Analyze each key_field
@@ -2721,6 +5159,91 @@ async def get_data_api(
                 os.unlink(tmp_path)
             except Exception:
                 pass
+#-------- NEW: EXTRACT FORM NAME ONLY --------
+verifier_instance: Optional[Verifier] = None
+@app.post("/api/extract_form_name")
+async def extract_form_name(file: UploadFile = File(...)):
+    """Extract only form name using fingerprints without full analysis"""
+    if not hasattr(app.state, "verifier") or app.state.verifier is None:
+        return JSONResponse({"error": "Verifier not initialized"}, status_code=500)
+
+    # Save uploaded file to temporary location
+    ext = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        content = await file.read()
+        if not content:
+            return JSONResponse({"error": "Empty file"}, status_code=400)
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        # Use the verifier from app.state
+        verifier = app.state.verifier
+        
+        # First, get first page image for processing
+        processed_path = verifier._get_first_page_image(tmp_path)
+        if not processed_path:
+            return JSONResponse({
+                "error": "Failed to process file for form name extraction",
+                "filename": file.filename
+            }, status_code=400)
+
+        try:
+            # Extract OCR text and boxes
+            words, boxes, w, h = ocr_extract_words_bboxes(processed_path)
+            query_fp = generate_fingerprint(words, boxes, w, h)
+
+            # Find best matching fingerprint
+            best_fp = None
+            best_score = 0.0
+
+            for fname, fp in verifier.fingerprints.items():
+                try:
+                    score = fingerprint_similarity(query_fp, fp)
+                except Exception:
+                    continue
+
+                if score > best_score:
+                    best_score = score
+                    best_fp = fname
+
+            # Map form name using CSV if available
+            mapped_form_name, mapped_classification_type = map_form_display(best_fp)
+            
+            out = {
+                "filename": file.filename,
+                "form_name": mapped_form_name,
+                "classification_type": mapped_classification_type,
+                "similarity": float(best_score),
+                "is_match": best_score >= verifier.fp_threshold,
+                "matched_original_name": best_fp,
+                "method": "fingerprint_only"
+            }
+
+            return JSONResponse(content=out)
+            
+        finally:
+            # Clean up temporary processed image if different from original
+            if processed_path != tmp_path and os.path.exists(processed_path):
+                try:
+                    os.remove(processed_path)
+                except Exception:
+                    pass
+                    
+    except Exception as e:
+        logger.exception(f"Form name extraction failed: {e}")
+        return JSONResponse({
+            "error": f"Form name extraction failed: {str(e)}",
+            "filename": file.filename
+        }, status_code=500)
+        
+    finally:
+        # Clean up original temporary file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 # ------- Health check -------
 @app.get("/health")
 async def health_check():
@@ -2738,48 +5261,15 @@ async def health_check():
         "pdf2image_available": PDF2IMAGE_AVAILABLE,
     }
     return JSONResponse(content=status)
-
-def run_extraction(document_path: str, model_path: str, output_file: str = "fields.txt"):
-    """
-    Run field extraction on a document using the DocumentFieldExtractor.
-    
-    Args:
-        document_path (str): Path to input PDF or image file.
-        model_path (str): Path to model directory (can be dummy path since fallback is used).
-        output_file (str): Output file to save extracted fields (default: fields.txt)
-    
-    Returns:
-        bool: True if successful, False otherwise.
-    """
-    if not os.path.exists(document_path):
-        print(f"ERROR: Document not found: {document_path}")
-        return False
-
-    # Supported extensions check
-    supported_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
-    ext = os.path.splitext(document_path)[1].lower()
-    if ext not in supported_ext:
-        print(f"ERROR: Unsupported file type: {ext}")
-        return False
-
-    try:
-        print("Initializing extractor...")
-        extractor = DocumentFieldExtractor(model_path=model_path)
-
-        print("Extracting fields...")
-        fields = extractor.extract_fields(document_path)
-
-        print(f"Saving results to {output_file}...")
-        success = extractor.save_fields(fields, output_file)
-
-    except Exception as e:
-        print(f"Error during extraction: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
 # ------- Main -------
 def main():
+    # Manage GPU memory at startup
+    manage_gpu_memory()
+    
+    parser = argparse.ArgumentParser(
+        description="Document Analysis API - Combined LiLT + Verification"
+    )
+
     parser = argparse.ArgumentParser(
         description="Document Analysis API - Combined LiLT + Verification"
     )
