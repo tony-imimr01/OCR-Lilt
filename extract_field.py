@@ -45,7 +45,8 @@ except ImportError:
 # Try to import transformers with fallback
 TRANSFORMERS_AVAILABLE = False
 try:
-    from transformers import AutoModelForTokenClassification, AutoTokenizer, BertForTokenClassification, BertConfig, BertTokenizerFast
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+    from transformers import BertForTokenClassification, BertConfig, BertTokenizerFast
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     print("WARNING: Transformers not available. Install with: pip install transformers")
@@ -56,6 +57,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("document_field_extractor")
+
+# ADD THIS LINE TO DISABLE INFO MESSAGES
+logger.setLevel(logging.WARNING)  # Only show warnings and above
 
 class SimpleLiLTProcessor:
     """Simple processor for LiLT-like models"""
@@ -93,23 +97,23 @@ class SimpleLiLTProcessor:
             logger.info(f"Attempting to load model from: {self.model_path}")
             
             # Create a simple BERT model for token classification
+            # First try to load config to detect model type
             try:
-                config = BertConfig.from_pretrained(
-                    "bert-base-uncased",
-                    num_labels=len(self.label_map),
-                    id2label=self.id2label,
-                    label2id={v: k for k, v in self.id2label.items()}
-                )
-                self.model = BertForTokenClassification(config).to(self.device)
-                self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-                
-                logger.info("Created new BERT model for token classification")
-                return True
-                
+                config = BertConfig.from_pretrained(self.model_path)
+                # Check if this is a layout-aware model
+                if hasattr(config, "has_bbox") and config.has_bbox:
+                    self.model_type = "layout_aware"
+                    logger.info("Detected layout-aware model (supports bbox)")
+                elif hasattr(config, "model_type") and ("layoutlm" in config.model_type.lower() or "lilt" in config.model_type.lower()):
+                    self.model_type = "layout_aware"
+                    logger.info("Detected layout-aware model type from config")
+                else:
+                    self.model_type = "standard"
+                    logger.info("Detected standard BERT model (no bbox support)")
             except Exception as e:
-                logger.warning(f"Could not create model: {e}")
-                return False
-                
+                logger.warning(f"Could not load config: {e}, assuming standard model")
+                self.model_type = "standard"
+
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False

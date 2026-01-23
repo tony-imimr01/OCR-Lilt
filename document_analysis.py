@@ -30,6 +30,8 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from datetime import datetime
 from math import sqrt
 
+from extract_field import DocumentFieldExtractor
+
 # ---- CUDA / Torch env ----
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -90,6 +92,8 @@ try:
 except Exception:
     easyocr = None
 
+LILT_MODEL = None
+
 # LiLT models
 LILT_AVAILABLE = False
 try:
@@ -123,6 +127,9 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("combined_document_analysis_api")
+
+# ADD THIS LINE TO DISABLE INFO MESSAGES
+logger.setLevel(logging.WARNING)  # Only show warnings and above
 
 def manage_gpu_memory():
     """Clear GPU memory and optimize usage"""
@@ -996,19 +1003,34 @@ def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict
     literal_str = repr(entities)
     return parse_entities_from_literal(literal_str, source_label="result1.json")
 
+import os
+
+def get_filename_from_upload(upload_file):
+    """
+    Extract the filename from an UploadFile object.
+    
+    Args:
+        upload_file: An UploadFile object with filename attribute
+        
+    Returns:
+        str: Just the filename part without any path information
+    """
+    # Get the filename attribute and extract just the base name
+    filename = upload_file.filename
+    return os.path.basename(filename)
+    
 def _extract_text_multipage(
     file_path: str, languages: str = "eng", conf_threshold: float = 0.15
 ) -> Tuple[List[Dict], str, int, List[Image.Image]]:
     """Extract text from multi-page document with robust bbox validation"""
     entities: List[Dict] = []
-    full_text_parts: List[str] = []
-    ext = os.path.splitext(file_path)[1].lower()
     images: List[Image.Image] = []
     clamped_count = 0
     validation_stats = {"total": 0, "valid": 0, "filtered": 0, "reasons": defaultdict(int)}
-   
+    
+    filename =get_filename_from_upload(file_path)
     # Load entities from result.json
-    entities = convert_result_json_to_test_page_data_in_memory("result1.json")
+    entities = convert_result_json_to_test_page_data_in_memory(filename)
     
     return entities, len(images), images
 
@@ -4394,7 +4416,7 @@ class DocumentAnalyzer:
         processing_time = time.time() - start_time
         logger.info(f"Analysis completed in {processing_time:.2f} seconds")
         return {
-            "document_name": os.path.basename(file_path),
+            "document_name": file_path,
             "page_count": page_count,
             "total_entities": len(filtered_entities),
             "entities": filtered_entities,
@@ -4678,7 +4700,8 @@ def map_form_display(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> 
 
 @app.post("/api/get_analysis_result")
 async def get_analysis_result(
-    file: UploadFile = File(...),
+    document: UploadFile = File(...),
+    analysis_data: UploadFile = File(...),
     language: Optional[str] = Form(None),
 ):
     """
@@ -4692,18 +4715,18 @@ async def get_analysis_result(
             raise HTTPException(503, "Analyzer not initialized")
         if not hasattr(app.state, "verifier") or app.state.verifier is None:
             raise HTTPException(503, "Verifier not initialized")
-        ext = os.path.splitext(file.filename)[1].lower()
+        ext = os.path.splitext(document.filename)[1].lower()
         if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
-            raise HTTPException(400, "Unsupported file type")
+            raise HTTPException(400, "Unsupported document type")
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
-            content = await file.read()
+            content = await document.read()
             if not content:
-                raise HTTPException(400, "Empty file")
+                raise HTTPException(400, "Empty document")
             tf.write(content)
             tmp_path = tf.name
         # Get document dimensions
         try:
-            ext = os.path.splitext(file.filename)[1].lower()
+            ext = os.path.splitext(document.filename)[1].lower()
             if ext == ".pdf":
                 if not PDF2IMAGE_AVAILABLE:
                     raise RuntimeError("pdf2image not available")
@@ -4723,6 +4746,9 @@ async def get_analysis_result(
         except Exception as e:
             logger.warning(f"Dimension extraction failed ({e}), using default")
             document_width, document_height = 1654, 2339
+
+        OUTPUT_FILE = "extracted_fields.txt"   # <-- Output file
+        success = run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
 
         langs_norm = _validate_and_normalize_langs(language)
         analyzer = app.state.analyzer
@@ -4785,16 +4811,16 @@ async def get_analysis_result(
         # Load key_fields from key_field.txt
         key_fields: List[str] = []
         try:
-            with open("key_field.txt", "r", encoding="utf-8") as f:
+            with open("extracted_fields.txt", "r", encoding="utf-8") as f:
                 key_fields = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
-            logger.warning("key_field.txt not found")
+            logger.warning("extracted_fields.txt not found")
             key_fields = []
         results: List[MultiKeyFieldResult] = []
         # Analyze each key_field
         for kf in key_fields:
             try:
-                raw_result = analyzer.analyze_file(tmp_path, kf, language_input=langs_norm)
+                raw_result = analyzer.analyze_file(analysis_data, kf, language_input=langs_norm)
                 # Convert entities (for API response)
                 entities_model = []
                 for e in raw_result.get("entities", []):
@@ -4877,7 +4903,7 @@ async def get_analysis_result(
                         logger.warning(f"Key field result conversion failed: {e}")
                         kfr_model = None
                 extraction = ExtractionResult(
-                    document_name=file.filename,
+                    document_name=document.filename,
                     page_count=raw_result.get("page_count", 1),
                     total_entities=len(entities_model),
                     entities=entities_model,
@@ -4897,7 +4923,7 @@ async def get_analysis_result(
             raw_form_name = v_res.get("form_name", "Unknown")
             mapped_form_name, mapped_classication_type = map_form_display(raw_form_name)
             verification_result = VerificationResult(
-                filename=v_res.get("filename", file.filename),
+                filename=v_res.get("filename", document.filename),
                 predicted_class=v_res.get("predicted_class", "Unknown"),
                 confidence=float(v_res.get("confidence", 0.0)),
                 form_name=mapped_form_name,  # ✅ mapped via CSV
@@ -5261,6 +5287,46 @@ async def health_check():
         "pdf2image_available": PDF2IMAGE_AVAILABLE,
     }
     return JSONResponse(content=status)
+
+def run_extraction(document_path: str, model_path: str, output_file: str = "fields.txt"):
+    """
+    Run field extraction on a document using the DocumentFieldExtractor.
+    
+    Args:
+        document_path (str): Path to input PDF or image file.
+        model_path (str): Path to model directory (can be dummy path since fallback is used).
+        output_file (str): Output file to save extracted fields (default: fields.txt)
+    
+    Returns:
+        bool: True if successful, False otherwise.
+    """
+    if not os.path.exists(document_path):
+        print(f"ERROR: Document not found: {document_path}")
+        return False
+
+    # Supported extensions check
+    supported_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
+    ext = os.path.splitext(document_path)[1].lower()
+    if ext not in supported_ext:
+        print(f"ERROR: Unsupported file type: {ext}")
+        return False
+
+    try:
+        print("Initializing extractor...")
+        extractor = DocumentFieldExtractor(model_path=model_path)
+
+        print("Extracting fields...")
+        fields = extractor.extract_fields(document_path)
+
+        print(f"Saving results to {output_file}...")
+        success = extractor.save_fields(fields, output_file)
+
+    except Exception as e:
+        print(f"Error during extraction: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 # ------- Main -------
 def main():
     # Manage GPU memory at startup
@@ -5344,6 +5410,7 @@ def main():
     logger.info("Starting Combined Document Analysis API...")
     # Initialize document analyzer
     config = LiLTConfig(model_path=args.model_path, qa_model_path=args.qa_model)
+    LILT_MODEL = args.model_path
     app.state.analyzer = DocumentAnalyzer(config)
     # Initialize verifier
     app.state.verifier = Verifier(
