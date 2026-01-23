@@ -9,10 +9,12 @@ __pycache__
 lilt_classification/
 lilt_text_extraction/
 lilt_text_extraction_model/
-lilt_model/
+lilt_model*/
 fingerprints.pkl
 
 images/
 temp/
 
 result*.*
+
+extracted_fields.txt
