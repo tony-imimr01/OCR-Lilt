@@ -1002,23 +1002,7 @@ def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict
 
     literal_str = repr(entities)
     return parse_entities_from_literal(literal_str, source_label="result1.json")
-
-import os
-
-def get_filename_from_upload(upload_file):
-    """
-    Extract the filename from an UploadFile object.
-    
-    Args:
-        upload_file: An UploadFile object with filename attribute
-        
-    Returns:
-        str: Just the filename part without any path information
-    """
-    # Get the filename attribute and extract just the base name
-    filename = upload_file.filename
-    return os.path.basename(filename)
-    
+   
 def _extract_text_multipage(
     file_path: str, languages: str = "eng", conf_threshold: float = 0.15
 ) -> Tuple[List[Dict], str, int, List[Image.Image]]:
@@ -1028,9 +1012,8 @@ def _extract_text_multipage(
     clamped_count = 0
     validation_stats = {"total": 0, "valid": 0, "filtered": 0, "reasons": defaultdict(int)}
     
-    filename =get_filename_from_upload(file_path)
     # Load entities from result.json
-    entities = convert_result_json_to_test_page_data_in_memory(filename)
+    entities = convert_result_json_to_test_page_data_in_memory(file_path)
     
     return entities, len(images), images
 
@@ -4708,8 +4691,35 @@ async def get_analysis_result(
     Combined endpoint - RETURNS ONLY result.json content directly
     """
     tmp_path = None
+    analysis_file_path = None
+    analysis_filename = None
     document_width = 0
     document_height = 0
+    
+    # Save analysis_data file to local test_images directory
+    try:
+        # Generate unique filename with timestamp
+        timestamp = int(time.time())
+        original_filename = analysis_data.filename
+        filename_safe = re.sub(r'[^\w\-_\.]', '_', original_filename)
+        analysis_filename = f"analysis_{timestamp}_{filename_safe}"
+        
+        # Create full file path
+        analysis_file_path = os.path.join("test_images", analysis_filename)
+        
+        # Read and save the file content
+        content = await analysis_data.read()
+        with open(analysis_file_path, "wb") as f:
+            f.write(content)
+        
+        logger.info(f"✅ Saved analysis data file to: {analysis_file_path}")
+        logger.info(f"📊 Analysis file size: {len(content)} bytes")
+        logger.info(f"📁 Analysis filename: {analysis_filename}")
+        logger.info(f"📍 Analysis file path: {analysis_file_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save analysis data file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save analysis data file: {str(e)}")
+        
     try:
         if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
             raise HTTPException(503, "Analyzer not initialized")
@@ -4763,7 +4773,7 @@ async def get_analysis_result(
             if not processed_path:
                 return JSONResponse({
                     "error": "Failed to process file for form name extraction",
-                    "filename": file.filename
+                    "filename": document.filename
                 }, status_code=400)
 
             try:
@@ -4797,7 +4807,7 @@ async def get_analysis_result(
             logger.exception(f"Form name extraction failed: {e}")
             return JSONResponse({
                 "error": f"Form name extraction failed: {str(e)}",
-                "filename": file.filename
+                "filename": document.filename
             }, status_code=500)
             
         finally:
@@ -4820,7 +4830,7 @@ async def get_analysis_result(
         # Analyze each key_field
         for kf in key_fields:
             try:
-                raw_result = analyzer.analyze_file(analysis_data, kf, language_input=langs_norm)
+                raw_result = analyzer.analyze_file(analysis_file_path, kf, language_input=langs_norm)
                 # Convert entities (for API response)
                 entities_model = []
                 for e in raw_result.get("entities", []):
@@ -4945,6 +4955,14 @@ async def get_analysis_result(
             document_width=document_width,
             document_height=document_height
         )
+        
+        if analysis_file_path and os.path.exists(analysis_file_path):
+            try:
+                logger.info(f"🧹 Cleaning up analysis file: {analysis_file_path}")
+                os.unlink(analysis_file_path)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to clean up analysis file {analysis_file_path}: {e}")
+
         # Save to disk
         try:
             with open("result.json", "w", encoding="utf-8") as f:
