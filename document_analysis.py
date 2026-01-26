@@ -1488,7 +1488,7 @@ class LiLTRelationExtractor:
         
         # Set memory limits
         max_entities_total = 100  # Maximum total entities to process
-        max_entities_per_page = 50  # Maximum entities per page
+        max_entities_per_page = 0  # Maximum entities per page
         
         if len(entities) > max_entities_total:
             logger.warning(f"Too many entities ({len(entities)}), limiting to {max_entities_total}")

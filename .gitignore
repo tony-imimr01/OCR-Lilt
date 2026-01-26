@@ -18,3 +18,5 @@ temp/
 result*.*
 
 extracted_fields.txt
+
+test_images/
