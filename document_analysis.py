@@ -1466,7 +1466,7 @@ class LiLTRelationExtractor:
         
         # Set memory limits
         max_entities_total = 100  # Maximum total entities to process
-        max_entities_per_page = 0  # Maximum entities per page
+        max_entities_per_page = 50  # Maximum entities per page
         
         if len(entities) > max_entities_total:
             logger.warning(f"Too many entities ({len(entities)}), limiting to {max_entities_total}")
@@ -5479,10 +5479,14 @@ async def get_analysis_result(
                         for e in filtered_entities:
                             try:
                                 bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                                
+                                # NEW: scale to 2480x3509
+                                scaled_data = scale_bbox_to_a4_300dpi(bbox_data, 1654, 2339)
+                                
                                 entities_model.append(ExtractedEntity(
                                     field=e.get("field", ""),
                                     value=e.get("value", ""),
-                                    bbox=BoundingBox(**bbox_data),
+                                    bbox=BoundingBox(**scaled_data),
                                     confidence=float(e.get("confidence", 0.0)),
                                     page_number=e.get("page_number", page_num)
                                 ))
