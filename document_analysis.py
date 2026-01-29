@@ -29,6 +29,9 @@ import numpy as np
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from datetime import datetime
 from math import sqrt
+import csv
+import json
+import ast
 
 from extract_field import DocumentFieldExtractor
 
@@ -197,8 +200,9 @@ class KeyFieldResult(BaseModel):
     structured_value: Optional[DataField] = None
     confidence: float
     bbox: BoundingBox
+    page_number: int = 1  # ✅ ADD THIS LINE - CRITICAL FIX
     context_entities: List[ExtractedEntity] = []
-    meta: Optional[Dict[str, Any]] = None
+    meta: Optional[Dict] = None
     extraction_method: Optional[str] = None
 
 class ExtractionResult(BaseModel):
@@ -887,33 +891,6 @@ def clamp_bbox_to_image(bbox: Dict[str, Any], img_width: int, img_height: int) -
         "width": w,
         "height": h
     }
-        
-def load_fulltext_from_file(file_path: str) -> List[Dict[str, Any]]:
-    """
-    Read and return the complete content of a file.
-    
-    Args:
-        file_path (str): Path to the file to be read
-        
-    Returns:
-        str: Complete content of the file
-        
-    Raises:
-        FileNotFoundError: If the file doesn't exist
-        IOError: If there are issues reading the file
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-        return content
-    except UnicodeDecodeError:
-        # Fall back to system default encoding if utf-8 fails
-        with open(file_path, 'r') as file:
-            content = file.read()
-        return content
-
-import json
-import ast
 
 def scale_bbox_to_a4_300dpi(raw_bbox: Dict, document_width: int, document_height: int) -> Dict:
     """
@@ -952,6 +929,7 @@ def parse_entities_from_literal(content: str, source_label: str = "<memory>") ->
         return data
     except (ValueError, SyntaxError) as e:
         raise ValueError(f"Invalid Python literal in {source_label}: {e}")
+
 
 def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict[str, Any]]:
     with open(json_path, "r", encoding="utf-8") as f:
@@ -1001,7 +979,7 @@ def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict
         entities.append(entity)
 
     literal_str = repr(entities)
-    return parse_entities_from_literal(literal_str, source_label="result1.json")
+    return parse_entities_from_literal(literal_str)
    
 def _extract_text_multipage(
     file_path: str, languages: str = "eng", conf_threshold: float = 0.15
@@ -2015,8 +1993,42 @@ class FormFieldDetector:
         intersection = len(words1.intersection(words2))
         union = len(words1.union(words2))
         return intersection / union if union > 0 else 0.0
-    import re
-
+    def _build_empty_result(self, key_field: str) -> Tuple[Dict, List[Dict]]:
+        """Build generic empty result for any field type when no value is found"""
+        empty_bbox = {"x": 0, "y": 0, "width": 1, "height": 1}
+        field_type = self._get_field_type(key_field)
+        
+        result = {
+            "field_name": key_field,
+            "value": "Not found",
+            "structured_value": {
+                "field_name": key_field,
+                "field_type": field_type,
+                "value": "Not found",
+                "confidence": 0.0,
+                "bbox": empty_bbox,
+            },
+            "confidence": 0.0,
+            "bbox": empty_bbox,
+            "context_entities": [],
+            "extraction_method": "none",
+            "meta": {"reason": f"No valid value found for field: '{key_field}'"},
+            "page_number": 1,
+            "found": False
+        }
+        
+        filtered_entity = {
+            "field": key_field,
+            "value": "Not found",
+            "bbox": empty_bbox,
+            "confidence": 0.0,
+            "page_number": 1,
+            "semantic_type": EntityTypes.ANSWER,
+            "semantic_confidence": 0.0,
+            "found": False
+        }
+        
+        return result, [filtered_entity]
     def _find_nearest_value_entity(self, entities: List[Dict], label_entity: Dict, label_text: str) -> Optional[Dict]:
         if not label_entity:
             return None
@@ -3334,6 +3346,8 @@ class FormFieldDetector:
             value = e.get("value", "").strip()
             if not value:
                 continue
+
+            value_lower =  value.lower()  # ✅ CRITICAL FIX: MUST ADD THIS LINE HERE
             
             # Score based on field-type validation
             score = 0.0
@@ -4184,6 +4198,8 @@ class FormFieldDetector:
             value = e.get("value", "").strip()
             if not value:
                 continue
+
+            value_lower =  value.lower()  # ✅ CRITICAL FIX: MUST ADD THIS LINE HERE
             
             bbox = e.get("bbox", {})
             # Prefer values from top to bottom (earlier in document)
@@ -4641,8 +4657,6 @@ def _build_result_json_payload(
     logger.info(f"result.json: {found_count}/{len(key_fields)} fields found")
     return out
 
-import csv
-
 FORM_NAME_CSV_PATH = "form_name_mapping.csv"  # adjust path as needed
 
 def map_form_display(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> Tuple[str, str]:
@@ -4681,263 +4695,54 @@ def map_form_display(raw_form_name: str, csv_path: str = FORM_NAME_CSV_PATH) -> 
     # No match: return original
     return raw_form_name, "Unknown"
 
-@app.post("/api/get_analysis_result")
-async def get_analysis_result(
-    document: UploadFile = File(...),
-    analysis_data: UploadFile = File(...),
-    language: Optional[str] = Form(None),
-):
-    """
-    Combined endpoint - RETURNS ONLY result.json content directly
-    """
-    tmp_path = None
-    analysis_file_path = None
-    analysis_filename = None
-    document_width = 0
-    document_height = 0
+def _process_multi_page_analysis(analysis_data: dict, tmp_path: str, analyzer, verifier, langs_norm: str, key_fields: List[str]) -> Tuple[List[MultiKeyFieldResult], Optional[VerificationResult], int, int]:
+    """Process multi-page analysis by analyzing each page separately and combining results.
     
-    # Save analysis_data file to local test_images directory
+    Returns: results, verification_result, document_width, document_height
+    """
+    all_results = []
+    document_width = 1654 # default
+    document_height = 2339 # default
+    
     try:
-        # Generate unique filename with timestamp
-        timestamp = int(time.time())
-        original_filename = analysis_data.filename
-        filename_safe = re.sub(r'[^\w\-_\.]', '_', original_filename)
-        analysis_filename = f"analysis_{timestamp}_{filename_safe}"
+        # Extract total pages from analysis data with proper type checking
+        if isinstance(analysis_data, dict):
+            total_pages = analysis_data.get("total_pages", 1)
+        elif isinstance(analysis_data, list):
+            total_pages = len(analysis_data)
+        else:
+            total_pages = 1
         
-        # Create full file path
-        analysis_file_path = os.path.join("test_images", analysis_filename)
+        logger.info(f"Processing {total_pages} pages from analysis data")
         
-        # Read and save the file content
-        content = await analysis_data.read()
-        with open(analysis_file_path, "wb") as f:
-            f.write(content)
+        # Convert multi-page PDF to images if needed
+        if tmp_path.lower().endswith('.pdf'):
+            if not PDF2IMAGE_AVAILABLE:
+                raise HTTPException(500, "pdf2image not available for PDF processing")
+            poppler_path = os.environ.get("POPPLER_PATH")
+            kwargs = {"poppler_path": poppler_path} if poppler_path else {}
+            images = convert_from_path(tmp_path, dpi=300, **kwargs)
+            if len(images) != total_pages:
+                logger.warning(f"PDF has {len(images)} pages but analysis data expects {total_pages}")
+                total_pages = min(len(images), total_pages)
+        else:
+            # Single image
+            images = [Image.open(tmp_path).convert("RGB")]
+            total_pages = 1
         
-        logger.info(f"✅ Saved analysis data file to: {analysis_file_path}")
-        logger.info(f"📊 Analysis file size: {len(content)} bytes")
-        logger.info(f"📁 Analysis filename: {analysis_filename}")
-        logger.info(f"📍 Analysis file path: {analysis_file_path}")
-    except Exception as e:
-        logger.error(f"❌ Failed to save analysis data file: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save analysis data file: {str(e)}")
-        
-    try:
-        if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
-            raise HTTPException(503, "Analyzer not initialized")
-        if not hasattr(app.state, "verifier") or app.state.verifier is None:
-            raise HTTPException(503, "Verifier not initialized")
-        ext = os.path.splitext(document.filename)[1].lower()
-        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
-            raise HTTPException(400, "Unsupported document type")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
-            content = await document.read()
-            if not content:
-                raise HTTPException(400, "Empty document")
-            tf.write(content)
-            tmp_path = tf.name
-        # Get document dimensions
-        try:
-            ext = os.path.splitext(document.filename)[1].lower()
-            if ext == ".pdf":
-                if not PDF2IMAGE_AVAILABLE:
-                    raise RuntimeError("pdf2image not available")
-                poppler_path = os.environ.get("POPPLER_PATH")
-                kwargs = {"poppler_path": poppler_path} if poppler_path else {}
-                images = convert_from_path(tmp_path, dpi=300, **kwargs)
-                for page_idx, img in enumerate(images):
-                    page_num = page_idx + 1
-                    img_width, img_height = img.size  # 🚨 CRITICAL: PAGE DIMENSIONS
-                    document_width, document_height = img.size
-            else:
-                # Image handling with Pillow
-                img = Image.open(tmp_path).convert("RGB")
-                img = ImageOps.exif_transpose(img)
-                document_width, document_height = img.size
-            logger.info(f"Document: {document_width}x{document_height}")
-        except Exception as e:
-            logger.warning(f"Dimension extraction failed ({e}), using default")
-            document_width, document_height = 1654, 2339
-
-        OUTPUT_FILE = "extracted_fields.txt"   # <-- Output file
-        success = run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
-
-        langs_norm = _validate_and_normalize_langs(language)
-        analyzer = app.state.analyzer
-        verifier = app.state.verifier
-
-        v_res = None
-        try:           
-            v_res = verifier.verify(tmp_path)  
-           
-            # First, get first page image for processing
-            processed_path = verifier._get_first_page_image(tmp_path)
-            if not processed_path:
-                return JSONResponse({
-                    "error": "Failed to process file for form name extraction",
-                    "filename": document.filename
-                }, status_code=400)
-
-            try:
-                # Extract OCR text and boxes
-                words, boxes, w, h = ocr_extract_words_bboxes(processed_path)
-                query_fp = generate_fingerprint(words, boxes, w, h)
-
-                # Find best matching fingerprint
-                best_fp = None
-                best_score = 0.0
-
-                for fname, fp in verifier.fingerprints.items():
-                    try:
-                        score = fingerprint_similarity(query_fp, fp)
-                    except Exception:
-                        continue
-
-                    if score > best_score:
-                        best_score = score
-                        best_fp = fname
-                
-            finally:
-                # Clean up temporary processed image if different from original
-                if processed_path != tmp_path and os.path.exists(processed_path):
-                    try:
-                        os.remove(processed_path)
-                    except Exception:
-                        pass
-                        
-        except Exception as e:
-            logger.exception(f"Form name extraction failed: {e}")
-            return JSONResponse({
-                "error": f"Form name extraction failed: {str(e)}",
-                "filename": document.filename
-            }, status_code=500)
-            
-        finally:
-            # Clean up original temporary file
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-
-        # Load key_fields from key_field.txt
-        key_fields: List[str] = []
-        try:
-            with open("extracted_fields.txt", "r", encoding="utf-8") as f:
-                key_fields = [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            logger.warning("extracted_fields.txt not found")
-            key_fields = []
-        results: List[MultiKeyFieldResult] = []
-        # Analyze each key_field
-        for kf in key_fields:
-            try:
-                raw_result = analyzer.analyze_file(analysis_file_path, kf, language_input=langs_norm)
-                # Convert entities (for API response)
-                entities_model = []
-                for e in raw_result.get("entities", []):
-                    try:
-                        bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                        entities_model.append(ExtractedEntity(
-                            field=e.get("field", ""),
-                            value=e.get("value", ""),
-                            bbox=BoundingBox(**bbox_data),
-                            confidence=float(e.get("confidence", 0.0)),
-                            page_number=int(e.get("page_number", 1))
-                        ))
-                    except Exception:
-                        continue
-                # Convert key_field_result
-                kfr_model = None
-                if raw_result.get("key_field_result"):
-                    kf_res = raw_result["key_field_result"]
-                    try:
-                        if isinstance(kf_res, list):
-                            # Multiple individual checkbox results
-                            kfr_list = []
-                            for res in kf_res:
-                                try:
-                                    bbox_data = res.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                                    page_num = int(res.get("page_number", 1))
-                                    # Create DataField for structured_value
-                                    structured_value = None
-                                    if res.get("structured_value"):
-                                        sv = res["structured_value"]
-                                        structured_value = DataField(
-                                            field_name=sv.get("field_name", res.get("field_name", "")),
-                                            field_type=sv.get("field_type", "individual_checkbox"),
-                                            value=sv.get("value", ""),
-                                            confidence=float(sv.get("confidence", 0.0)),
-                                            bbox=BoundingBox(**sv.get("bbox", bbox_data))
-                                        )
-                                    
-                                    kfr_list.append(KeyFieldResult(
-                                        field_name=res.get("field_name", ""),
-                                        value=res.get("value", ""),
-                                        structured_value=structured_value,
-                                        confidence=float(res.get("confidence", 0.0)),
-                                        bbox=BoundingBox(**bbox_data),
-                                        page_number=page_num,
-                                        meta=res.get("meta"),
-                                        extraction_method=res.get("extraction_method")
-                                    ))
-                                except Exception as e:
-                                    logger.warning(f"Individual checkbox conversion failed: {e}")
-                                    continue
-                            kfr_model = kfr_list
-                        else:
-                            # Single result
-                            bbox_data = kf_res.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
-                            page_num = int(kf_res.get("page_number", 1))
-                            # Create DataField for structured_value
-                            structured_value = None
-                            if kf_res.get("structured_value"):
-                                sv = kf_res["structured_value"]
-                                structured_value = DataField(
-                                    field_name=sv.get("field_name", kf_res.get("field_name", "")),
-                                    field_type=sv.get("field_type", "text"),
-                                    value=sv.get("value", ""),
-                                    confidence=float(sv.get("confidence", 0.0)),
-                                    bbox=BoundingBox(**sv.get("bbox", bbox_data))
-                                )
-                            
-                            kfr_model = KeyFieldResult(
-                                field_name=kf_res.get("field_name", ""),
-                                value=kf_res.get("value", ""),
-                                structured_value=structured_value,
-                                confidence=float(kf_res.get("confidence", 0.0)),
-                                bbox=BoundingBox(**bbox_data),
-                                page_number=page_num,
-                                meta=kf_res.get("meta"),
-                                extraction_method=kf_res.get("extraction_method")
-                            )
-                    except Exception as e:
-                        logger.warning(f"Key field result conversion failed: {e}")
-                        kfr_model = None
-                extraction = ExtractionResult(
-                    document_name=document.filename,
-                    page_count=raw_result.get("page_count", 1),
-                    total_entities=len(entities_model),
-                    entities=entities_model,
-                    key_field_result=kfr_model,
-                    full_text_snippet=raw_result.get("full_text", "")[:1000],
-                    processing_time=float(raw_result.get("processing_time", 0.0)),
-                    language_used=langs_norm,
-                    model_used=raw_result.get("model_used", False)
-                )
-                results.append(MultiKeyFieldResult(key_field=kf, extraction=extraction))
-            except Exception as e:
-                results.append(MultiKeyFieldResult(key_field=kf, error=str(e)))
-        # Run verifier
+        # Run document-wide verification
         verification_result = None
         try:
-            #v_res = verifier.verify(tmp_path)  
+            v_res = verifier.verify(tmp_path)
             raw_form_name = v_res.get("form_name", "Unknown")
-            mapped_form_name, mapped_classication_type = map_form_display(raw_form_name)
+            mapped_form_name, mapped_classification_type = map_form_display(raw_form_name)
+            
             verification_result = VerificationResult(
-                filename=v_res.get("filename", document.filename),
+                filename=v_res.get("filename", os.path.basename(tmp_path)),
                 predicted_class=v_res.get("predicted_class", "Unknown"),
                 confidence=float(v_res.get("confidence", 0.0)),
-                form_name=mapped_form_name,  # ✅ mapped via CSV
-                classification_type=best_fp,
+                form_name=mapped_form_name,
+                classification_type=mapped_classification_type,
                 in_training_data=bool(v_res.get("in_training_data", False)),
                 training_similarity=float(v_res.get("training_similarity", 0.0)),
                 training_info=v_res.get("training_info", ""),
@@ -4946,36 +4751,824 @@ async def get_analysis_result(
                 method=v_res.get("method", "hybrid")
             )
         except Exception as e:
-            logger.exception("Verification failed")
-        # BUILD result.json and RETURN IT DIRECTLY
-        result_json_content = _build_result_json_payload(
-            key_fields=key_fields,
+            logger.warning(f"Verification failed: {e}")
+        
+        # Process each page
+        page_results_map = {} # key_field -> list of results per page
+        
+        for page_num in range(1, total_pages + 1):
+            logger.info(f"Processing page {page_num}/{total_pages}")
+            
+            # Create temporary file for this page
+            page_tmp_path = None
+            try:
+                if len(images) > 1:
+                    # Save this page as temporary image
+                    page_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_page{page_num}.png")
+                    images[page_num-1].save(page_tmp.name, 'PNG')
+                    page_tmp_path = page_tmp.name
+                else:
+                    page_tmp_path = tmp_path
+                
+                # Process each key field for this page
+                for kf in key_fields:
+                    try:
+                        raw_result = analyzer.analyze_file(page_tmp_path, kf, language_input=langs_norm)
+                        
+                        if kf not in page_results_map:
+                            page_results_map[kf] = []
+                        
+                        # Create page-specific result
+                        page_result = MultiKeyFieldResult(
+                            key_field=kf,
+                            extraction=ExtractionResult(
+                                document_name=os.path.basename(tmp_path),
+                                page_count=1,
+                                total_entities=len(raw_result.get("entities", [])),
+                                entities=raw_result.get("entities", []),
+                                key_field_result=raw_result.get("key_field_result"),
+                                full_text_snippet=raw_result.get("full_text", "")[:1000],
+                                processing_time=float(raw_result.get("processing_time", 0.0)),
+                                language_used=langs_norm,
+                                model_used=raw_result.get("model_used", False)
+                            ),
+                            page_number=page_num
+                        )
+                        
+                        page_results_map[kf].append(page_result)
+                        
+                    except Exception as e:
+                        logger.error(f"Field '{kf}' on page {page_num} failed: {e}")
+                        if kf not in page_results_map:
+                            page_results_map[kf] = []
+                        
+                        page_results_map[kf].append(MultiKeyFieldResult(
+                            key_field=kf,
+                            error=str(e),
+                            page_number=page_num
+                        ))
+            
+            finally:
+                # Clean up page temporary file
+                if page_tmp_path and page_tmp_path != tmp_path and os.path.exists(page_tmp_path):
+                    try:
+                        os.unlink(page_tmp_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up page temp file: {e}")
+        
+        # Combine results from all pages
+        for kf in key_fields:
+            if kf not in page_results_map:
+                all_results.append(MultiKeyFieldResult(
+                    key_field=kf,
+                    error="No results for any page"
+                ))
+                continue
+            
+            page_results = page_results_map[kf]
+            
+            # Find best result across all pages
+            best_result = None
+            best_confidence = -1
+            
+            for page_result in page_results:
+                if page_result.extraction and page_result.extraction.key_field_result:
+                    if isinstance(page_result['extraction'].key_field_result, dict):
+                        conf = page_result['extraction'].key_field_result.get('confidence', 0.0)
+                        if conf > best_confidence:
+                            best_confidence = conf
+                            best_result = page_result
+                    elif isinstance(page_result["extraction"].key_field_result, list):
+                        if page_result["extraction"].key_field_result:
+                            conf = page_result["extraction"].key_field_result[0].confidence
+                            if conf > best_confidence:
+                                best_confidence = conf
+                                best_result = page_result
+            
+            if best_result:
+                all_results.append(MultiKeyFieldResult(
+                    key_field=kf,
+                    extraction=best_result["extraction"]
+                ))
+            else:
+                all_results.append(MultiKeyFieldResult(
+                    key_field=kf,
+                    error="No valid result found on any page"
+                ))
+    
+    except Exception as e:
+        logger.error(f"Multi-page processing failed: {e}")
+        raise HTTPException(500, f"Multi-page processing failed: {str(e)}")
+    
+    return all_results, verification_result, document_width, document_height
+
+def split_entities_by_page(
+    entities: List[Dict[str, Any]], 
+    document_height: int = 2339,
+    expected_pages: int = 1
+) -> List[Dict[str, Any]]:
+    """
+    Split entities between pages using adaptive gap analysis.
+    Supports ANY number of pages (1, 2, 3+) with robust fallbacks.
+    NO HARDCODING - dynamically detects page boundaries from entity distribution.
+    
+    Args:
+        entities: List of entity dicts with 'bbox' containing 'y' coordinate
+        document_height: Total height of document image in pixels
+        expected_pages: Expected number of pages (default: 2)
+    
+    Returns:
+        List of entities with 'page_number' assigned (1-indexed)
+    """
+    if not entities:
+        return entities
+    
+    # Extract Y positions of entity tops (robust handling)
+    y_positions = []
+    for e in entities:
+        bbox = e.get("bbox", {})
+        y = bbox.get("y")
+        if y is not None and isinstance(y, (int, float)):
+            y_positions.append(float(y))
+    
+    if not y_positions:
+        logger.warning("⚠️ No valid Y positions found in entities, assigning all to page 1")
+        for e in entities:
+            e["page_number"] = 1
+        return entities
+    
+    # Sort Y positions for gap analysis
+    sorted_y = sorted(y_positions)
+    
+    # CRITICAL FIX #1: Detect natural page splits using adaptive gap analysis
+    # For N pages, we need N-1 split points
+    split_points = []
+    
+    if expected_pages > 1 and len(sorted_y) > 1:
+        # Calculate gaps between consecutive Y positions
+        gaps = []
+        for i in range(1, len(sorted_y)):
+            gap = sorted_y[i] - sorted_y[i-1]
+            gaps.append((gap, sorted_y[i-1], sorted_y[i]))  # (gap_size, y_before, y_after)
+        
+        # Sort gaps by size (largest first)
+        gaps.sort(key=lambda x: x[0], reverse=True)
+        
+        # Find significant gaps (>15% of document height OR >2x average gap)
+        avg_gap = sum(g[0] for g in gaps) / len(gaps) if gaps else 0
+        min_significant_gap = max(document_height * 0.15, avg_gap * 2.0)
+        
+        significant_gaps = [
+            (gap, y_before, y_after) 
+            for gap, y_before, y_after in gaps 
+            if gap > min_significant_gap
+        ]
+        
+        # Take top (expected_pages - 1) significant gaps as split points
+        significant_gaps = significant_gaps[:expected_pages - 1]
+        
+        if significant_gaps:
+            # Calculate split points as midpoints of significant gaps
+            split_points = [
+                y_before + (y_after - y_before) / 2.0
+                for _, y_before, y_after in significant_gaps
+            ]
+            split_points.sort()  # Ensure ascending order
+            
+            logger.info(f"✅ Found {len(split_points)} significant gap(s) for {expected_pages} pages:")
+            for i, sp in enumerate(split_points, 1):
+                logger.info(f"    Split {i}: Y={sp:.0f}px (gap size: {significant_gaps[i-1][0]:.0f}px)")
+        else:
+            logger.warning(f"⚠️ No significant gaps found (> {min_significant_gap:.0f}px), using equal-height split")
+    
+    # CRITICAL FIX #2: Fallback to equal-height splits if no natural gaps found
+    if not split_points:
+        # Create (expected_pages - 1) split points at equal intervals
+        split_points = [
+            document_height * (i / expected_pages)
+            for i in range(1, expected_pages)
+        ]
+        logger.info(f"🔧 Using equal-height split for {expected_pages} pages:")
+        for i, sp in enumerate(split_points, 1):
+            logger.info(f"    Split {i}: Y={sp:.0f}px (document height: {document_height}px)")
+    
+    # CRITICAL FIX #3: Assign page numbers based on split points
+    page_counts = {i: 0 for i in range(1, expected_pages + 1)}
+    
+    for entity in entities:
+        bbox = entity.get("bbox", {})
+        y_top = bbox.get("y", 0)
+        
+        # Determine page number based on split points (1-indexed)
+        page_num = 1
+        for i, split_y in enumerate(split_points, 1):
+            if y_top >= split_y:
+                page_num = i + 1
+            else:
+                break
+        
+        # Clamp to valid page range (safety for edge cases)
+        page_num = max(1, min(page_num, expected_pages))
+        
+        entity["page_number"] = page_num
+        page_counts[page_num] += 1
+    
+    # Log results
+    total_entities = len(entities)
+    logger.info(f"✅ Split complete across {expected_pages} pages:")
+    for page_num in range(1, expected_pages + 1):
+        count = page_counts.get(page_num, 0)
+        pct = (count / total_entities * 100) if total_entities > 0 else 0
+        logger.info(f"  Page {page_num}: {count} entities ({pct:.1f}%)")
+    
+    # DEBUG: Show sample entities from each page
+    for page_num in range(1, expected_pages + 1):
+        page_entities = [e for e in entities if e.get("page_number") == page_num]
+        if page_entities:
+            sample_count = min(3, len(page_entities))
+            logger.debug(f"📄 Page {page_num} samples (first {sample_count}):")
+            for i in range(sample_count):
+                e = page_entities[i]
+                text_preview = e.get('value', '')[:40].replace('\n', ' ')
+                logger.debug(f"    Y={e['bbox']['y']:4.0f}px: '{text_preview}'")
+    
+    return entities
+
+# ✅ STANDALONE FUNCTION (NO 'self' parameter)
+def _build_multi_page_result_json_payload(
+    key_fields: List[str],
+    results: List[MultiKeyFieldResult],
+    verification_result: Optional[VerificationResult],
+    document_width: int,
+    document_height: int,
+    total_pages: int = 2
+) -> dict:
+    """
+    Build result.json with CORRECT multi-page grouping.
+    CRITICAL FIXES:
+    1. Uses list [] not set() for out["fields"] initialization
+    2. Gets page_number from entities (most reliable source)
+    3. Handles any number of pages dynamically (no hardcoding)
+    """
+    # ✅ CRITICAL FIX #1: Initialize fields as LIST (not set!)
+    out = {
+        "form_name": verification_result.form_name if verification_result else None,
+        "classification_type": verification_result.classification_type if verification_result else None,
+        "document_dimensions": {"width": document_width, "height": document_height},
+        "target_dimensions": {"width": 1654, "height": 2339},
+        "total_key_fields": len(key_fields),
+        "total_pages": total_pages,
+        "fields": [],  # ✅ MUST BE LIST - NOT set()
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "stats": {"found": 0, "missing": 0, "pages": total_pages}
+    }
+    
+    # Deduplication set (separate from out["fields"])
+    seen_fields = set()
+    
+    # ✅ CRITICAL FIX #2: Get page number from entities (most reliable source)
+    for result in results:
+        # Skip invalid results
+        if not result or not result.extraction or not result.extraction.key_field_result:
+            continue
+        
+        kfr = result.extraction.key_field_result
+        base_key_field = result.key_field
+        
+        # ✅ DETERMINE PAGE NUMBER FROM ENTITIES (authoritative source)
+        page_num = 1
+        if result.extraction.entities and len(result.extraction.entities) > 0:
+            # Use first entity's page number (all entities for this result should be same page)
+            page_num = getattr(result.extraction.entities[0], 'page_number', 1)
+        else:
+            # Fallback: try to get from kfr if available
+            if isinstance(kfr, list) and kfr:
+                page_num = getattr(kfr[0], 'page_number', 1)
+            elif kfr:
+                page_num = getattr(kfr, 'page_number', 1)
+        
+        # Handle checkbox results (list format)
+        if isinstance(kfr, list):
+            for checkbox in kfr:
+                value = checkbox.value or ""
+                field_name = getattr(checkbox, 'field_name', base_key_field)
+                
+                # Skip exact duplicates on same page with same value
+                dup_key = (field_name, page_num, value)
+                if dup_key in seen_fields:
+                    logger.debug(f"Skipping duplicate field: {dup_key}")
+                    continue
+                seen_fields.add(dup_key)
+                
+                # Build field entry
+                raw_bbox = {
+                    "x": checkbox.bbox.x,
+                    "y": checkbox.bbox.y,
+                    "width": checkbox.bbox.width,
+                    "height": checkbox.bbox.height
+                }
+                scaled_bbox = _scale_bbox_to_target(raw_bbox, document_width, document_height)
+                out["fields"].append({  # ✅ SAFE: out["fields"] is LIST
+                    "index": len(out["fields"]) + 1,
+                    "key_field": field_name,
+                    "field_name": field_name,
+                    "value": value,
+                    "confidence": round(float(checkbox.confidence or 0.0), 4),
+                    "page_number": page_num,
+                    "bbox": scaled_bbox,
+                    "found": True,
+                    "source": "individual_checkbox"
+                })
+                logger.debug(f"Added checkbox field: {field_name} (page {page_num})")
+        
+        # Handle single result fields
+        elif kfr:
+            value = kfr.value or ""
+            field_name = getattr(kfr, 'field_name', base_key_field)
+            
+            # Skip exact duplicates
+            dup_key = (field_name, page_num, value)
+            if dup_key in seen_fields:
+                logger.debug(f"Skipping duplicate field: {dup_key}")
+                continue
+            seen_fields.add(dup_key)
+            
+            # Build field entry
+            raw_bbox = {
+                "x": kfr.bbox.x,
+                "y": kfr.bbox.y,
+                "width": kfr.bbox.width,
+                "height": kfr.bbox.height
+            }
+            scaled_bbox = _scale_bbox_to_target(raw_bbox, document_width, document_height)
+            out["fields"].append({  # ✅ SAFE: out["fields"] is LIST
+                "index": len(out["fields"]) + 1,
+                "key_field": field_name,
+                "field_name": field_name,
+                "value": value,
+                "confidence": round(float(kfr.confidence or 0.0), 4),
+                "page_number": page_num,
+                "bbox": scaled_bbox,
+                "found": True,
+                "source": "key_field_result"
+            })
+            logger.debug(f"Added field: {field_name} (page {page_num})")
+    
+    # ✅ CRITICAL: Sort ALL fields by page_number FIRST, then by vertical position (y)
+    out["fields"].sort(key=lambda f: (f["page_number"], f["bbox"]["y"]))
+    
+    # ✅ Renumber indexes sequentially AFTER sorting
+    for i, field in enumerate(out["fields"], 1):
+        field["index"] = i
+    
+    # ✅ ACCURATE STATS: Count UNIQUE key_fields found (not field entries)
+    found_key_fields = set()
+    for field in out["fields"]:
+        if field.get("found", False):
+            # Map checkbox options back to base field pattern for stats
+            if "checkbox_option" in field["key_field"].lower():
+                found_key_fields.add("individual_checkbox")
+            else:
+                found_key_fields.add(field["key_field"])
+    
+    out["stats"]["found"] = len(found_key_fields)
+    out["stats"]["missing"] = len(key_fields) - out["stats"]["found"]
+    
+    # Log final page distribution
+    pages_in_output = sorted(set(f["page_number"] for f in out["fields"]))
+    logger.info(f"✅ Built result.json with {len(out['fields'])} fields across {len(pages_in_output)} pages:")
+    for page_num in pages_in_output:
+        count = sum(1 for f in out["fields"] if f["page_number"] == page_num)
+        logger.info(f"  Page {page_num}: {count} fields")
+    logger.info(f"📊 Stats: {out['stats']['found']} found, {out['stats']['missing']} missing, {out['stats']['pages']} total pages")
+    
+    return out
+
+def assign_fields_to_pages(result_json_content: dict) -> dict:
+    """Alternate assigning fields to pages 1 and 2"""
+    fields = result_json_content.get("fields", [])
+    
+    for i, field in enumerate(fields):
+        # Alternate: odd indices -> page 1, even indices -> page 2
+        field["page_number"] = 1 if i % 2 == 0 else 2
+    
+    # Update stats
+    result_json_content["stats"]["pages"] = 2
+    
+    return result_json_content
+
+def parse_page_fields_from_file(file_path: str = "extracted_fields.txt") -> Dict[int, List[str]]:
+    """
+    Parse extracted_fields.txt with page markers (# PAGE X).
+    Returns Dict[page_number, List[field_names]] with ONLY actual field names.
+    
+    Format example:
+      # PAGE 1
+      Field Name 1
+      Field Name 2
+      
+      # PAGE 2
+      Field Name 3
+      Field Name 4
+    
+    Rules:
+      - Lines starting with '#' are COMMENTS (ignored as fields)
+      - '# PAGE X' sets current page context (X = integer)
+      - Non-comment lines are field names for current page
+      - Blank lines are ignored
+      - Field names are cleaned (trailing colons/whitespace removed)
+    """
+    page_fields: Dict[int, List[str]] = {}
+    current_page = 1  # Default page if no markers found
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        for line_num, line in enumerate(lines, 1):
+            original_line = line
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Check for page marker: # PAGE X (case-insensitive, flexible spacing)
+            # Must be EXACTLY "# PAGE X" pattern - not other comments
+            page_match = re.match(r'^#\s*PAGE\s*(\d+)', line, re.IGNORECASE)
+            if page_match:
+                current_page = int(page_match.group(1))
+                if current_page not in page_fields:
+                    page_fields[current_page] = []
+                logger.debug(f"Line {line_num}: Page marker → PAGE {current_page}")
+                continue
+            
+            # Skip ALL other comment lines (anything starting with # but not PAGE marker)
+            if line.startswith('#'):
+                logger.debug(f"Line {line_num}: Skipping comment: '{original_line.strip()}'")
+                continue
+            
+            # This is an actual field name - add to current page
+            if current_page not in page_fields:
+                page_fields[current_page] = []
+            
+            # Clean field name:
+            # 1. Remove trailing colons (common in form field names)
+            # 2. Remove extra whitespace
+            # 3. Skip empty fields
+            clean_field = line.rstrip(':').strip()
+            if not clean_field:
+                logger.debug(f"Line {line_num}: Skipping empty field")
+                continue
+            
+            # Special handling: Fix "No" to "No." for contact fields
+            if clean_field.endswith("No"):
+                clean_field = clean_field + "."
+            
+            page_fields[current_page].append(clean_field)
+            logger.debug(f"Line {line_num}: Added field '{clean_field}' to PAGE {current_page}")
+        
+        # Remove pages with no actual fields
+        valid_pages = {p: fs for p, fs in page_fields.items() if fs}
+        
+        if not valid_pages:
+            logger.warning(f"Parsed file but found NO actual fields (only comments/markers) in {file_path}")
+            return {}
+        
+        # Log parsed structure for verification
+        logger.info(f"Parsed {len(valid_pages)} pages with fields from {file_path}")
+        for page_num in sorted(valid_pages.keys()):
+            fields = valid_pages[page_num]
+            preview = fields[:3] + (["..."] if len(fields) > 3 else [])
+            logger.info(f"  PAGE {page_num}: {len(fields)} fields - {preview}")
+        
+        return valid_pages
+    
+    except FileNotFoundError:
+        logger.warning(f"Key fields file not found: {file_path}")
+        return {}
+    except Exception as e:
+        logger.error(f"Error parsing {file_path}: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return {}
+
+# ✅ CRITICAL FIX: Preserve page number from entities during conversion
+def _convert_kf_result_to_model(kf_result: Any, fallback_page_num: int = 1) -> Union[KeyFieldResult, List[KeyFieldResult], None]:
+    """Convert raw detection result to KeyFieldResult model WITH page_number preserved"""
+    if isinstance(kf_result, list):
+        kfr_list = []
+        for res in kf_result:
+            try:
+                # ✅ Get page number from result OR fallback
+                page_num = res.get("page_number", fallback_page_num) if isinstance(res, dict) else getattr(res, 'page_number', fallback_page_num)
+                
+                # Build structured_value if exists
+                structured_value = None
+                if res.get("structured_value"):
+                    sv = res["structured_value"]
+                    structured_value = DataField(
+                        field_name=sv.get("field_name", res.get("field_name", "")),
+                        field_type=sv.get("field_type", "individual_checkbox"),
+                        value=sv.get("value", ""),
+                        confidence=float(sv.get("confidence", 0.0)),
+                        bbox=BoundingBox(**sv.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1}))
+                    )
+                
+                kfr = KeyFieldResult(
+                    field_name=res.get("field_name", ""),
+                    value=res.get("value", ""),
+                    structured_value=structured_value,
+                    confidence=float(res.get("confidence", 0.0)),
+                    bbox=BoundingBox(**res.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})),
+                    page_number=int(page_num),  # ✅ PRESERVE PAGE NUMBER
+                    meta=res.get("meta"),
+                    extraction_method=res.get("extraction_method")
+                )
+                kfr_list.append(kfr)
+            except Exception as e:
+                logger.warning(f"Failed to convert checkbox result: {e}")
+                continue
+        return kfr_list if len(kfr_list) > 1 else (kfr_list[0] if kfr_list else None)
+    else:
+        try:
+            page_num = kf_result.get("page_number", fallback_page_num) if isinstance(kf_result, dict) else getattr(kf_result, 'page_number', fallback_page_num)
+            
+            structured_value = None
+            if kf_result.get("structured_value"):
+                sv = kf_result["structured_value"]
+                structured_value = DataField(
+                    field_name=sv.get("field_name", kf_result.get("field_name", "")),
+                    field_type=sv.get("field_type", "text"),
+                    value=sv.get("value", ""),
+                    confidence=float(sv.get("confidence", 0.0)),
+                    bbox=BoundingBox(**sv.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1}))
+                )
+            
+            return KeyFieldResult(
+                field_name=kf_result.get("field_name", ""),
+                value=kf_result.get("value", ""),
+                structured_value=structured_value,
+                confidence=float(kf_result.get("confidence", 0.0)),
+                bbox=BoundingBox(**kf_result.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})),
+                page_number=int(page_num),  # ✅ PRESERVE PAGE NUMBER
+                meta=kf_result.get("meta"),
+                extraction_method=kf_result.get("extraction_method")
+            )
+        except Exception as e:
+            logger.warning(f"Failed to convert key field result: {e}")
+            return None
+
+def get_all_key_fields(page_fields: Dict[int, List[str]]) -> List[str]:
+    """Get all unique key fields across all pages (deduplicated)"""
+    all_fields = set()
+    for fields in page_fields.values():
+        all_fields.update(fields)
+    return sorted(all_fields)
+
+
+def get_fields_for_page(page_fields: Dict[int, List[str]], page_num: int) -> List[str]:
+    """Get fields for a specific page (empty list if page not found)"""
+    return page_fields.get(page_num, [])
+
+# ------- Main API Endpoint -------
+@app.post("/api/get_analysis_result")
+async def get_analysis_result(
+    document: UploadFile = File(...),
+    analysis_data: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+    """
+    Combined endpoint with CORRECT page detection.
+    FIXED: Now properly handles single-page documents vs multi-page templates.
+    """
+    tmp_path = None
+    analysis_file_path = None
+    
+    # Save analysis_data file
+    try:
+        os.makedirs("test_images", exist_ok=True)
+        timestamp = int(time.time())
+        original_filename = analysis_data.filename
+        filename_safe = re.sub(r'[^\w\-_\.]', '_', original_filename)
+        analysis_filename = f"analysis_{timestamp}_{filename_safe}"
+        analysis_file_path = os.path.join("test_images", analysis_filename)
+        content = await analysis_data.read()
+        with open(analysis_file_path, "wb") as f:
+            f.write(content)
+        logger.info(f"✅ Saved analysis data file to: {analysis_file_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save analysis data file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save analysis data file: {str(e)}")
+    
+    try:
+        if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
+            raise HTTPException(503, "Analyzer not initialized")
+        if not hasattr(app.state, "verifier") or app.state.verifier is None:
+            raise HTTPException(503, "Verifier not initialized")
+        
+        ext = os.path.splitext(document.filename)[1].lower()
+        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
+            raise HTTPException(400, "Unsupported document type")
+        
+        # Save document file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            content = await document.read()
+            if not content:
+                raise HTTPException(400, "Empty document")
+            tf.write(content)
+            tmp_path = tf.name
+        
+        langs_norm = _validate_and_normalize_langs(language)
+        analyzer = app.state.analyzer
+        verifier = app.state.verifier
+
+        # Run extraction to get field mapping
+        OUTPUT_FILE = "extracted_fields.txt"
+        run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
+
+        # ✅ PARSE PAGE-SPECIFIC FIELDS FROM TEMPLATE
+        page_field_mapping = parse_page_fields_from_file("extracted_fields.txt")
+        
+        if not page_field_mapping:
+            logger.error("❌ No valid key fields found in extracted_fields.txt!")
+            raise HTTPException(
+                500,
+                "No valid key fields configured. extracted_fields.txt must contain '# PAGE X' markers followed by actual field names."
+            )
+        
+        # ✅ DETERMINE ACTUAL NUMBER OF PAGES IN DOCUMENT
+        logger.info("🔍 DETERMINING ACTUAL PAGE COUNT...")
+        
+        # Load entities FIRST to see actual page distribution
+        entities = []
+        try:
+            logger.info(f"Loading entities from analysis JSON: {analysis_file_path}")
+            entities = convert_result_json_to_test_page_data_in_memory(analysis_file_path)
+            logger.info(f"✅ Loaded {entities} entities")
+        except Exception as e:
+            logger.error(f"❌ Failed to load entities from JSON: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load entities from JSON: {str(e)}")
+        
+        # Get ACTUAL page count from entities (not from template)
+        actual_pages = sorted(set(e.get("page_number", 1) for e in entities))
+        actual_page_count = len(actual_pages)
+        
+        logger.info(f"📊 ACTUAL DOCUMENT: {actual_page_count} page(s) - Entities on pages: {actual_pages}")
+        logger.info(f"📊 TEMPLATE EXPECTS: {len(page_field_mapping)} page(s)")
+        
+        # ✅ CRITICAL FIX: If template has more pages than actual document, ONLY use pages that exist
+        if actual_page_count < len(page_field_mapping):
+            logger.warning(f"⚠️ Template expects {len(page_field_mapping)} pages but document has only {actual_page_count}. Using only page 1 fields.")
+            # Keep only page 1 fields from template
+            page_field_mapping = {1: page_field_mapping.get(1, [])}
+        
+        # Get all unique fields from template
+        all_key_fields = get_all_key_fields(page_field_mapping)
+        logger.info(f"✅ Processing {len(page_field_mapping)} page(s) with {len(all_key_fields)} unique fields")
+        
+        # Get document dimensions
+        document_width, document_height = 1654, 2339
+        try:
+            with open(analysis_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data.get("associations") and len(data["associations"]) > 0:
+                    img_info = data["associations"][0].get("image_dimensions", {})
+                    document_width = img_info.get("width", 1654)
+                    document_height = img_info.get("height", 2339)
+        except Exception as e:
+            logger.warning(f"Could not get dimensions from JSON: {e}")
+
+        # ✅ PER-PAGE FIELD DETECTION (ONLY FOR ACTUAL PAGES)
+        results: List[MultiKeyFieldResult] = []
+        
+        for page_num in sorted(page_field_mapping.keys()):
+            # Skip if this page doesn't exist in actual document
+            if page_num > actual_page_count:
+                logger.warning(f"⚠️ Template page {page_num} doesn't exist in document. Skipping.")
+                continue
+                
+            page_fields = get_fields_for_page(page_field_mapping, page_num)
+            if not page_fields:
+                continue
+            
+            page_entities = [e for e in entities if e.get("page_number", 1) == page_num]
+            if not page_entities:
+                logger.warning(f"⚠️ No entities found for page {page_num}")
+                continue
+            
+            logger.info(f"📄 Processing page {page_num}: {len(page_fields)} fields, {len(page_entities)} entities")
+            
+            for kf in page_fields:
+                try:
+                    kf_result, filtered_entities = analyzer.field_detector.detect_field(page_entities, kf)
+                    
+                    if kf_result:
+                        # Force correct page number
+                        if isinstance(kf_result, list):
+                            for res in kf_result:
+                                res["page_number"] = page_num
+                        else:
+                            kf_result["page_number"] = page_num
+                        
+                        # Convert to model with page number preservation
+                        kfr_model = _convert_kf_result_to_model(kf_result, fallback_page_num=page_num)
+                        
+                        # Build extraction result
+                        entities_model = []
+                        for e in filtered_entities:
+                            try:
+                                bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
+                                entities_model.append(ExtractedEntity(
+                                    field=e.get("field", ""),
+                                    value=e.get("value", ""),
+                                    bbox=BoundingBox(**bbox_data),
+                                    confidence=float(e.get("confidence", 0.0)),
+                                    page_number=e.get("page_number", page_num)
+                                ))
+                            except Exception as e:
+                                logger.warning(f"Failed to convert entity: {e}")
+                                continue
+                        
+                        extraction = ExtractionResult(
+                            document_name=document.filename,
+                            page_count=actual_page_count,  # ✅ Use ACTUAL page count
+                            total_entities=len(entities_model),
+                            entities=entities_model,
+                            key_field_result=kfr_model,
+                            full_text_snippet="",
+                            processing_time=0.0,
+                            language_used=language,
+                            model_used=False
+                        )
+                        results.append(MultiKeyFieldResult(key_field=kf, extraction=extraction))
+                        
+                except Exception as e:
+                    logger.error(f"Field '{kf}' on page {page_num} failed: {e}", exc_info=True)
+                    results.append(MultiKeyFieldResult(key_field=kf, error=str(e)))
+
+        # Run verification
+        verification_result = None
+        try:
+            v_res = verifier.verify(tmp_path)
+            raw_form_name = v_res.get("form_name", "Unknown")
+            mapped_form_name, mapped_classification_type = map_form_display(raw_form_name)
+            verification_result = VerificationResult(
+                filename=v_res.get("filename", document.filename),
+                predicted_class=v_res.get("predicted_class", "Unknown"),
+                confidence=float(v_res.get("confidence", 0.0)),
+                form_name=mapped_form_name,
+                classification_type=mapped_classification_type,
+                in_training_data=bool(v_res.get("in_training_data", False)),
+                training_similarity=float(v_res.get("training_similarity", 0.0)),
+                training_info=v_res.get("training_info", ""),
+                extracted_text_preview=v_res.get("extracted_text_preview", ""),
+                processing_time=float(v_res.get("processing_time", 0.0)),
+                method=v_res.get("method", "hybrid")
+            )
+        except Exception as e:
+            logger.warning(f"Verification failed: {e}")
+        
+        # Build result.json with proper page grouping
+        result_json_content = _build_multi_page_result_json_payload(
+            key_fields=all_key_fields,
             results=results,
             verification_result=verification_result,
             document_width=document_width,
-            document_height=document_height
+            document_height=document_height,
+            total_pages=actual_page_count  # ✅ Use ACTUAL page count, not template page count
         )
-        
-        if analysis_file_path and os.path.exists(analysis_file_path):
-            try:
-                logger.info(f"🧹 Cleaning up analysis file: {analysis_file_path}")
-                os.unlink(analysis_file_path)
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to clean up analysis file {analysis_file_path}: {e}")
 
+        # ✅ Sort fields by page THEN y-position
+        result_json_content["fields"].sort(key=lambda f: (f["page_number"], f["bbox"]["y"]))
+        
+        # ✅ Renumber indexes sequentially
+        for i, field in enumerate(result_json_content["fields"], 1):
+            field["index"] = i
+        
+        # Verify final output
+        pages_in_output = sorted(set(f["page_number"] for f in result_json_content["fields"]))
+        logger.info(f"✅ FINAL OUTPUT:")
+        for page_num in pages_in_output:
+            page_fields = [f for f in result_json_content["fields"] if f["page_number"] == page_num]
+            found_count = sum(1 for f in page_fields if f.get("found", False))
+            logger.info(f"  Page {page_num}: {found_count}/{len(page_fields)} fields found")
+        
         # Save to disk
         try:
             with open("result.json", "w", encoding="utf-8") as f:
                 json.dump(result_json_content, f, ensure_ascii=False, indent=2)
-            logger.info(f"Saved result.json: {result_json_content['stats']['found']}/{len(key_fields)}")
+            found_count = result_json_content['stats']['found']
+            logger.info(f"✅ Saved result.json: {found_count}/{len(all_key_fields)} fields found")
         except Exception as e:
             logger.warning(f"result.json save failed: {e}")
-        # RETURN ONLY result.json_content
+        
         return result_json_content
+    
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        logger.exception("get_data_api error")
+        logger.exception("get_analysis_result error")
         return {
             "status": "error",
             "message": "internal error",
@@ -4989,6 +5582,12 @@ async def get_analysis_result(
                 os.unlink(tmp_path)
             except Exception:
                 pass
+        if analysis_file_path and os.path.exists(analysis_file_path):
+            try:
+                os.unlink(analysis_file_path)
+            except Exception:
+                pass
+
 @app.post("/api/get_data")
 async def get_data_api(
     file: UploadFile = File(...),
@@ -5306,7 +5905,7 @@ async def health_check():
     }
     return JSONResponse(content=status)
 
-def run_extraction(document_path: str, model_path: str, output_file: str = "fields.txt"):
+def run_extraction(document_path: str, model_path: str, output_file: str = "extracted_fields.txt"):
     """
     Run field extraction on a document using the DocumentFieldExtractor.
     
@@ -5424,6 +6023,7 @@ def main():
         result = verifier.verify(args.input)
         print(json.dumps(result, indent=2))
         return
+
     # Initialize the API
     logger.info("Starting Combined Document Analysis API...")
     # Initialize document analyzer

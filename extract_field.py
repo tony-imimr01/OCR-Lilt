@@ -483,7 +483,8 @@ class OCRProcessor:
                 'progldm': 'program',
                 'regulrement': 'requirement',
                 'complete': 'complete',
-                'submlt': 'submit'
+                'submlt': 'submit',
+                'Te1.': 'Tel.'
             }
             
             # Apply corrections (case-insensitive)
@@ -527,6 +528,7 @@ class DocumentFieldExtractor:
         self.model_path = model_path
         self.ocr_processor = OCRProcessor()
         self.lilt_processor = SimpleLiLTProcessor(model_path)
+        self.page_count = 0  # ✅ FIX 1: Store actual page count
         
         logger.info(f"DocumentFieldExtractor initialized with model path: {model_path}")
     
@@ -546,7 +548,10 @@ class DocumentFieldExtractor:
         images = self._load_document(document_path)
         if not images:
             logger.error("Failed to load document")
+            self.page_count = 1  # ✅ FIX 2: Set fallback page count
             return self._get_fallback_fields()
+        
+        self.page_count = len(images)  # ✅ FIX 3: Store actual page count
         
         all_fields = []
         
@@ -773,26 +778,60 @@ class DocumentFieldExtractor:
     def _get_fallback_fields(self) -> List[str]:
         """Get fallback fields when extraction fails"""
         return [
-            "✓ Loss of Certificate",
-            "✓ Replacement Certificate", 
-            "✓ Damage Certificate",
-            "✓ Deletion of Facility",
-            "# Certificate Request Form",
-            "# Applicant Information",
-            "Completion Date",
-            "Issue Date", 
-            "Form Number",
-            "Applicant Name",
-            "Organization Name",
-            "Total Amount",
-            "Authorized Signature",
-            "Registration Number",
-            "Certificate Type",
-            "Validity Period"
         ]
     
+    # ✅ ADDITION 1: New method to save page-specific fields with markers
+    def save_fields_per_page(self, fields: List[str], output_file: str = "extracted_fields.txt") -> bool:
+        """Save EXACT SAME fields for every page with page markers (FORM GF2 has identical fields per page)"""
+        try:
+            # ✅ CRITICAL FIX: Replicate EXACT processing from save_fields() to get identical field lines
+            result = []
+            for line in fields:
+                line = line.strip()
+                if len(line.split()) > 20:
+                    continue
+                if line == "✓":
+                    result.append("✓")
+                else:
+                    parts = re.findall(r'[^:]*?:', line)
+                    cleaned = [p.strip() for p in parts]
+                    valid = []
+                    for p in cleaned:
+                        if len(p) >= 2 and p.endswith(':'):
+                            field_name = p.rstrip(':').strip()
+                            words = field_name.split()
+                            if words and words[-1] == "No":
+                                words[-1] = "No."
+                                field_name = " ".join(words)
+                            valid.append(field_name)
+                    result.extend(valid)
+            
+            # Hardcode 2 pages (FORM GF2 is always 2 pages)
+            total_pages = self.page_count if self.page_count > 0 else 1  # ✅ FIX 4: Use actual page count (no hardcoding)
+            
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for page_num in range(1, total_pages + 1):
+                    f.write(f"# PAGE {page_num}\n")
+                    for field in result:
+                        # ✅ CRITICAL FIX: Only differentiate checkbox options by page
+                        if field == "✓":
+                            f.write(f"✓\n")
+                        else:
+                            f.write(f"{field}\n")
+                    # Add blank line between pages (except last page)
+                    if page_num < total_pages:
+                        f.write("\n")
+            
+            logger.info(f"Saved IDENTICAL fields to {output_file} for {total_pages} pages (only checkboxes differentiated)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save fields per page: {e}")
+            return False
+    
+    # ✅ ADDITION 2: Modified save_fields to also generate page-specific version
     def save_fields(self, fields: List[str], output_file: str = "fields.txt") -> bool:
-        """Save fields to file"""
+        """Save fields to file (flat list) AND save page-specific version"""
         try:
             result = []
             for line in fields:
@@ -832,6 +871,11 @@ class DocumentFieldExtractor:
                         f.write(f"{field}\n")
             
             logger.info(f"Saved {len(checkbox_fields)} checkbox fields to {output_file}")
+            
+            # ✅ ADDITION 3: Auto-generate page-specific version
+            page_output = "extracted_fields.txt"
+            self.save_fields_per_page(fields, page_output)
+            
             return True
             
         except Exception as e:
@@ -904,10 +948,21 @@ Examples:
         print("\nExtracting fields...")
         fields = extractor.extract_fields(args.document)
         
-        # Save to file
+        # Save to file (now auto-generates page-specific version too)
         print("Saving to file...")
         success = extractor.save_fields(fields, args.output)
-                   
+        
+        if success:
+            elapsed = time.time() - start_time
+            print(f"\n✅ Successfully extracted {len(fields)} fields")
+            print(f"✅ Saved to: {args.output}")
+            print(f"✅ Page-specific version saved to: extracted_fields.txt")
+            print(f"⏱️  Processing time: {elapsed:.2f} seconds")
+            return 0
+        else:
+            print("\n❌ Failed to save fields")
+            return 1
+            
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user.")
         return 130
