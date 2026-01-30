@@ -916,6 +916,30 @@ def scale_bbox_to_a4_300dpi(raw_bbox: Dict, document_width: int, document_height
         "confidence": raw_bbox.get("confidence", 1.0),
     }
 
+def scale_bbox_to_a4_400dpi(raw_bbox: Dict, document_width: int, document_height: int) -> Dict:
+    """
+    Scale bbox to target 2480x3509 (e.g. A4 at ~300 DPI).
+    raw_bbox uses keys: x, y, width, height (in pixels of original doc).
+    """
+    x = float(raw_bbox.get("x", 0))
+    y = float(raw_bbox.get("y", 0))
+    width = float(raw_bbox.get("width", 0))
+    height = float(raw_bbox.get("height", 0))
+
+    target_w = 1654
+    target_h = 2339
+
+    scale_x = target_w / max(1, document_width)
+    scale_y = target_h / max(1, document_height)
+
+    return {
+        "x": int(round(x * scale_x)),
+        "y": int(round(y * scale_y)),
+        "width": int(round(width * scale_x)),
+        "height": int(round(height * scale_y)),
+        "confidence": raw_bbox.get("confidence", 1.0),
+    }
+
 def parse_entities_from_literal(content: str, source_label: str = "<memory>") -> List[Dict[str, Any]]:
     """
     Same logic as load_entities_from_file, but works on a string
@@ -960,7 +984,7 @@ def convert_result_json_to_test_page_data_in_memory(json_path: str) -> List[Dict
             raw_bbox = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0, "confidence": 1.0}
 
         # NEW: scale to 2480x3509
-        scaled = scale_bbox_to_a4_300dpi(raw_bbox, 1654, 2339)
+        scaled = scale_bbox_to_a4_400dpi(raw_bbox, 1654, 2339)
 
         entity = {
             "field": f"word_{idx}",
@@ -5481,7 +5505,7 @@ async def get_analysis_result(
                                 bbox_data = e.get("bbox", {"x": 0, "y": 0, "width": 1, "height": 1})
                                 
                                 # NEW: scale to 2480x3509
-                                scaled_data = scale_bbox_to_a4_300dpi(bbox_data, 1654, 2339)
+                                scaled_data = scale_bbox_to_a4_400dpi(bbox_data, 2480, 3509)
                                 
                                 entities_model.append(ExtractedEntity(
                                     field=e.get("field", ""),
