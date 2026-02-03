@@ -30,7 +30,6 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from datetime import datetime
 from math import sqrt
 import csv
-import json
 import ast
 
 from extract_field import DocumentFieldExtractor
@@ -5368,6 +5367,8 @@ async def get_analysis_result(
     """
     tmp_path = None
     analysis_file_path = None
+
+    global LILT_MODEL
     
     # Save analysis_data file
     try:
@@ -5392,7 +5393,7 @@ async def get_analysis_result(
             raise HTTPException(503, "Verifier not initialized")
         
         ext = os.path.splitext(document.filename)[1].lower()
-        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]:
+        if ext not in [".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif", ".json"]:
             raise HTTPException(400, "Unsupported document type")
         
         # Save document file
@@ -5409,7 +5410,7 @@ async def get_analysis_result(
 
         # Run extraction to get field mapping
         OUTPUT_FILE = "extracted_fields.txt"
-        run_extraction(tmp_path, LILT_MODEL, OUTPUT_FILE)
+        run_extraction(analysis_file_path, LILT_MODEL, OUTPUT_FILE)
 
         # ✅ PARSE PAGE-SPECIFIC FIELDS FROM TEMPLATE
         page_field_mapping = parse_page_fields_from_file("extracted_fields.txt")
@@ -5950,7 +5951,7 @@ def run_extraction(document_path: str, model_path: str, output_file: str = "extr
         return False
 
     # Supported extensions check
-    supported_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
+    supported_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.json'}
     ext = os.path.splitext(document_path)[1].lower()
     if ext not in supported_ext:
         print(f"ERROR: Unsupported file type: {ext}")
@@ -5962,9 +5963,6 @@ def run_extraction(document_path: str, model_path: str, output_file: str = "extr
 
         print("Extracting fields...")
         fields = extractor.extract_fields(document_path)
-
-        print(f"Saving results to {output_file}...")
-        success = extractor.save_fields(fields, output_file)
 
     except Exception as e:
         print(f"Error during extraction: {e}")
@@ -6056,7 +6054,10 @@ def main():
     logger.info("Starting Combined Document Analysis API...")
     # Initialize document analyzer
     config = LiLTConfig(model_path=args.model_path, qa_model_path=args.qa_model)
+    
+    global LILT_MODEL
     LILT_MODEL = args.model_path
+
     app.state.analyzer = DocumentAnalyzer(config)
     # Initialize verifier
     app.state.verifier = Verifier(

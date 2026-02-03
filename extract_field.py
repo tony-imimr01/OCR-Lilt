@@ -16,6 +16,8 @@ from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
 from PIL import Image
 import cv2
+import json
+from typing import List, Tuple
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -88,163 +90,373 @@ class SimpleLiLTProcessor:
         self.load_model()
     
     def load_model(self):
-        """Try to load a transformer model, fallback to simple rules"""
+        """Try to load a transformer model with proper LiLT compatibility"""
         try:
             if not TRANSFORMERS_AVAILABLE:
-                logger.warning("Transformers not available, using fallback")
+                logger.warning("Transformers not available, using fallback to rule-based processing")
                 return False
             
-            logger.info(f"Attempting to load model from: {self.model_path}")
+            logger.info(f"Attempting to load LiLT model from: {self.model_path}")
             
-            # Create a simple BERT model for token classification
-            # First try to load config to detect model type
+            # Step 1: Load tokenizer WITH critical fixes
             try:
-                config = BertConfig.from_pretrained(self.model_path)
-                # Check if this is a layout-aware model
-                if hasattr(config, "has_bbox") and config.has_bbox:
-                    self.model_type = "layout_aware"
-                    logger.info("Detected layout-aware model (supports bbox)")
-                elif hasattr(config, "model_type") and ("layoutlm" in config.model_type.lower() or "lilt" in config.model_type.lower()):
-                    self.model_type = "layout_aware"
-                    logger.info("Detected layout-aware model type from config")
-                else:
-                    self.model_type = "standard"
-                    logger.info("Detected standard BERT model (no bbox support)")
+                # ✅ FIX 1: Enable trust_remote_code for custom LiLT tokenizer
+                # ✅ FIX 2: Explicitly handle Mistral regex bug (disable for LiLT)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True,      # Required for custom LiLT tokenizer
+                    use_fast=True,
+                    fix_mistral_regex=False      # LiLT ≠ Mistral - disable this fix
+                )
+                logger.info(f"Tokenizer loaded successfully (vocab size: {len(self.tokenizer)})")
+                logger.info(f"Tokenizer class: {self.tokenizer.__class__.__name__}")
             except Exception as e:
-                logger.warning(f"Could not load config: {e}, assuming standard model")
-                self.model_type = "standard"
-
+                logger.warning(f"Tokenizer loading failed: {e}")
+                # Fallback to RoBERTa base tokenizer (LiLT is RoBERTa-based)
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        "roberta-base",
+                        use_fast=True
+                    )
+                    logger.info("Loaded fallback RoBERTa base tokenizer")
+                except Exception as e2:
+                    logger.error(f"Failed to load fallback tokenizer: {e2}")
+                    return False
+            
+            # Step 2: Load model WITH critical fixes
+            try:
+                # ✅ FIX 3: Use AutoModelForTokenClassification (NOT BertForTokenClassification)
+                # ✅ FIX 4: Enable trust_remote_code for custom LiLT model
+                # ✅ FIX 5: Ignore size mismatches for label count differences
+                self.model = AutoModelForTokenClassification.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True,      # Required for custom LiLT model
+                    ignore_mismatched_sizes=True # Handle custom label counts
+                )
+                logger.info(f"LiLT model loaded successfully (num labels: {self.model.num_labels})")
+                logger.info(f"Model class: {self.model.__class__.__name__}")
+            except Exception as e:
+                logger.error(f"Model loading failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+            
+            # Step 3: Move to device and set eval mode
+            try:
+                self.model.to(self.device)
+                self.model.eval()
+                logger.info(f"Model moved to {self.device} and set to eval mode")
+            except Exception as e:
+                logger.error(f"Failed to move model to device: {e}")
+                return False
+            
+            return True
+                
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Critical failure in load_model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def process_document(self, words: List[str], bboxes: List[List[int]]) -> List[Dict]:
-        """Process document using model or fallback rules"""
+        """Process document with intelligent model fallback"""
+        # Always try model first if available
         if self.model and self.tokenizer and len(words) > 0:
             try:
-                return self._process_with_model(words, bboxes)
+                entities = self._process_with_model(words, bboxes)
+                
+                # Check if model gave meaningful results
+                field_count = sum(1 for e in entities if e.get("label") == "FIELD")
+                total_count = len(entities)
+                
+                logger.info(f"Model results: {field_count} FIELD entities out of {total_count} total")
+                
+                # If model found reasonable number of fields, use it
+                if field_count >= 3 and total_count > 5:
+                    logger.info(f"Using model results ({field_count} fields detected)")
+                    return entities
+                else:
+                    logger.info(f"Model results insufficient, using rule-based")
+                    return self._process_with_rules(words, bboxes)
+                    
             except Exception as e:
-                logger.error(f"Model processing failed, using fallback: {e}")
+                logger.error(f"Model processing failed: {e}")
                 return self._process_with_rules(words, bboxes)
         else:
+            # Model not available, use rule-based
             return self._process_with_rules(words, bboxes)
     
     def _process_with_model(self, words: List[str], bboxes: List[List[int]]) -> List[Dict]:
-        """Process with actual model"""
+        """FIXED: Process with model - proper bbox handling, 4-class mapping, and robust fallback"""
         try:
-            if not words or not bboxes:
-                return []
+            if not words or not bboxes or not self.model or not self.tokenizer:
+                logger.warning("Missing model/tokenizer — using rule-based fallback")
+                return self._process_with_rules(words, bboxes)
             
-            # Truncate if too long
-            max_len = min(128, len(words))  # Reduced for simplicity
-            words = words[:max_len]
-            bboxes = bboxes[:max_len]
+            logger.info(f"Processing {len(words)} words with model")
             
-            # Tokenize
+            # ✅ Check model configuration
+            logger.info(f"Model configuration:")
+            logger.info(f"  - Model class: {self.model.__class__.__name__}")
+            logger.info(f"  - Num labels: {self.model.num_labels}")
+            logger.info(f"  - Device: {self.device}")
+
+            # ✅ FIXED Label mapping - USE WHAT YOUR MODEL ACTUALLY HAS
+            logger.info(f"Model's own label mapping: {self.model.config.id2label}")
+
+            # CRITICAL: Use EXACT labels from your model's diagnostic
+            id2label = {
+                0: "answer",      # Filled values
+                1: "checkbox",    # Checkboxes  
+                2: "other",       # Regular text (not fields)
+                3: "question",    # Form field labels (what you want!)
+                4: "header"       # Headers
+            }
+
+            # If model has its own mapping, use it instead
+            if hasattr(self.model.config, 'id2label') and self.model.config.id2label:
+                # Convert model's labels to lowercase for consistency
+                id2label = {}
+                for k, v in self.model.config.id2label.items():
+                    try:
+                        id2label[int(k)] = v.lower()
+                    except:
+                        id2label[int(k)] = str(v).lower()
+
+            logger.info(f"Using label mapping: {id2label}")
+
+            # CRITICAL: Map model's labels to your entity types
+            label_to_entity = {
+                "question": "FIELD",    # Form field labels = FIELD entities
+                "answer": "VALUE",      # Filled values = VALUE entities
+                "checkbox": "CHECKBOX", # Checkboxes = CHECKBOX entities
+                "header": "HEADER",     # Headers = HEADER entities
+                "other": "O",           # Regular text = ignore
+                "o": "O"                # Also handle uppercase
+            }
+            
+            # ✅ Normalize bboxes to [0, 1000] range
+            if bboxes and all(len(b) >= 4 for b in bboxes):
+                all_x1 = [b[0] for b in bboxes]
+                all_y1 = [b[1] for b in bboxes]
+                all_x2 = [b[2] for b in bboxes]
+                all_y2 = [b[3] for b in bboxes]
+                doc_width = max(1, max(all_x2) - min(all_x1))
+                doc_height = max(1, max(all_y2) - min(all_y1))
+            else:
+                doc_width, doc_height = 2480, 3508
+            
+            logger.info(f"Document size for normalization: {doc_width}x{doc_height}")
+            
+            normalized_bboxes = []
+            for bbox in bboxes:
+                if len(bbox) >= 4:
+                    x1, y1, x2, y2 = bbox[:4]
+                    norm_x1 = max(0, min(1000, int((x1 * 1000) / doc_width)))
+                    norm_y1 = max(0, min(1000, int((y1 * 1000) / doc_height)))
+                    norm_x2 = max(0, min(1000, int((x2 * 1000) / doc_width)))
+                    norm_y2 = max(0, min(1000, int((y2 * 1000) / doc_height)))
+                    if norm_x2 <= norm_x1: norm_x2 = norm_x1 + 1
+                    if norm_y2 <= norm_y1: norm_y2 = norm_y1 + 1
+                    normalized_bboxes.append([norm_x1, norm_y1, norm_x2, norm_y2])
+                else:
+                    normalized_bboxes.append([0, 0, 10, 10])
+            
+            # ✅ Tokenize with word alignment
             encoding = self.tokenizer(
                 words,
                 is_split_into_words=True,
-                return_offsets_mapping=True,
                 padding="max_length",
                 truncation=True,
-                max_length=128,
+                max_length=256,
                 return_tensors="pt"
             )
             
-            # Get word IDs for alignment
-            word_ids = encoding.word_ids()
+            word_ids = encoding.word_ids(batch_index=0)
+            logger.debug(f"First 10 word_ids: {word_ids[:10]}")
             
-            # Create bbox tensor
+            # ✅ Create token bboxes
             token_bboxes = []
             for word_id in word_ids:
-                if word_id is not None and 0 <= word_id < len(bboxes):
-                    token_bboxes.append(bboxes[word_id])
-                else:
+                if word_id is None:
                     token_bboxes.append([0, 0, 0, 0])
+                elif 0 <= word_id < len(normalized_bboxes):
+                    token_bboxes.append(normalized_bboxes[word_id])
+                else:
+                    token_bboxes.append([0, 0, 10, 10])
             
-            # Convert to tensor
-            bbox_tensor = torch.tensor([token_bboxes], dtype=torch.long).to(self.device)
-            
-            # Move input tensors to device
+            # ✅ Prepare tensors
             input_ids = encoding['input_ids'].to(self.device)
             attention_mask = encoding['attention_mask'].to(self.device)
+            bbox_tensor = torch.tensor([token_bboxes], dtype=torch.long).to(self.device)
             
-            # Run inference
+            logger.debug(f"Input shapes - input_ids: {input_ids.shape}, bbox: {bbox_tensor.shape}")
+            
+            # ✅ Run inference
             with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    bbox=bbox_tensor
-                )
+                try:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        bbox=bbox_tensor
+                    )
+                except RuntimeError as e:
+                    logger.error(f"Model runtime error: {e}")
+                    try:
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        )
+                        logger.info("Model run without bbox (text-only fallback)")
+                    except Exception as e2:
+                        logger.error(f"Text-only inference also failed: {e2}")
+                        return self._process_with_rules(words, bboxes)
             
-            # Get predictions
-            predictions = outputs.logits.argmax(-1).squeeze().cpu().tolist()
+            # ✅ Get predictions
+            logits = outputs.logits
+            logger.debug(f"Logits shape: {logits.shape}")
             
-            # Handle batch dimension
-            if isinstance(predictions, list) and predictions and isinstance(predictions[0], list):
-                predictions = predictions[0]
+            predictions = logits.argmax(dim=-1).squeeze(0).cpu().tolist()
+            probabilities = torch.softmax(logits, dim=-1).squeeze(0).cpu().tolist()
             
-            # Convert predictions to word-level labels
-            word_predictions = {}
-            for idx, word_id in enumerate(word_ids):
-                if word_id is not None and word_id >= 0:
-                    if word_id not in word_predictions:
-                        word_predictions[word_id] = []
-                    word_predictions[word_id].append(predictions[idx] if idx < len(predictions) else 0)
-            
-            # Take most common prediction for each word
+            # ✅ Diagnose prediction uniformity - CRITICAL FIX: Return immediately on failure
             from collections import Counter
+            pred_counter = Counter(predictions)
+            total_preds = len(predictions)
+            most_common_pred, most_common_count = pred_counter.most_common(1)[0]
+            most_common_percentage = (most_common_count / total_preds) * 100
+            
+            logger.info(f"Prediction distribution: {pred_counter}")
+            logger.info(f"Most common prediction: {most_common_pred} ({most_common_percentage:.1f}%)")
+            
+            # 🔴 IMMEDIATE RETURN on suspicious predictions (prevents later errors)
+            if most_common_percentage > 85:
+                logger.info(
+                    f"Model predictions are suspiciously uniform "
+                    f"({most_common_percentage:.1f}% class {most_common_pred}) - "
+                    f"likely uninitialized classification head. Falling back to rule-based."
+                )
+                return self._process_with_rules(words, bboxes)  # ✅ EARLY RETURN HERE
+            
+            # ✅ Convert token → word predictions
+            word_predictions = {}
+            word_confidences = {}  # Stores LIST OF FLOATS per word_id
+            
+            for token_idx, (word_id, pred_id) in enumerate(zip(word_ids, predictions)):
+                if word_id is None or word_id < 0 or token_idx >= len(probabilities):
+                    continue
+                
+                confidence = probabilities[token_idx][pred_id] if pred_id < len(probabilities[token_idx]) else 0.0
+                label_name = id2label.get(pred_id, "O")
+                entity_type = label_to_entity.get(label_name, "O")
+                
+                if word_id not in word_predictions:
+                    word_predictions[word_id] = []
+                    word_confidences[word_id] = []
+                
+                word_predictions[word_id].append(entity_type)
+                word_confidences[word_id].append(confidence)  # ← APPENDS FLOAT
+            
+            # ✅ CRITICAL FIX: Aggregate predictions CORRECTLY (no sum() on float!)
             final_predictions = {}
+            final_confidences = {}
+            
             for word_id, preds in word_predictions.items():
-                if preds:
-                    most_common = Counter(preds).most_common(1)[0][0]
-                    final_predictions[word_id] = most_common
+                if not preds:
+                    continue
+                
+                # Get confidence list for this word (list of floats)
+                conf_list = word_confidences[word_id]
+                
+                # Find index of prediction with HIGHEST confidence (not average!)
+                best_idx = max(range(len(preds)), key=lambda i: conf_list[i])
+                best_confidence = conf_list[best_idx]
+                best_entity_type = preds[best_idx]
+                
+                if best_confidence > 0.3:
+                    final_predictions[word_id] = best_entity_type
+                    final_confidences[word_id] = best_confidence
             
-            # Convert predictions to entities
+            logger.debug(f"Word predictions sample: {list(final_predictions.items())[:10]}")
+            
+            # ✅ Build entities with merging logic
             entities = []
-            current_entity = None
             
+            # FIRST: Create entities from model predictions
             for i, word in enumerate(words):
                 if i >= len(bboxes):
-                    break
-                    
-                pred_id = final_predictions.get(i, 0)
-                label = self.label_map.get(pred_id, "O")
+                    continue
                 
-                if label.startswith("B-"):
-                    if current_entity:
-                        entities.append(current_entity)
-                    current_entity = {
+                entity_type = final_predictions.get(i, "O")
+                if entity_type == "O":
+                    continue
+                
+                # Merge with previous entity if same type and on same line
+                should_merge = False
+                if entities and entity_type in ["FIELD", "VALUE"]:
+                    last_entity = entities[-1]
+                    if last_entity["label"] == entity_type:
+                        y_diff = abs(last_entity["bbox"][1] - bboxes[i][1])
+                        if y_diff < 20:
+                            should_merge = True
+                
+                if should_merge:
+                    last_entity = entities[-1]
+                    last_entity["text"] += " " + word
+                    last_entity["words"].append(word)
+                    last_entity["bbox"] = [
+                        min(last_entity["bbox"][0], bboxes[i][0]),
+                        min(last_entity["bbox"][1], bboxes[i][1]),
+                        max(last_entity["bbox"][2], bboxes[i][2]),
+                        max(last_entity["bbox"][3], bboxes[i][3])
+                    ]
+                else:
+                    entities.append({
                         "text": word,
-                        "label": label[2:],
-                        "type": label[2:],
+                        "label": entity_type,
+                        "type": entity_type,
                         "words": [word],
-                        "bbox": bboxes[i] if i < len(bboxes) else [0, 0, 0, 0]
-                    }
-                elif label.startswith("I-"): # and current_entity and label[2:] == current_entity["label"]:
-                    current_entity["text"] += " " + word +"\n"
-                    #current_entity["words"].append(word)
-                #elif current_entity:
-                #    entities.append(current_entity)
-                #    current_entity = None
+                        "bbox": bboxes[i],
+                        "confidence": final_confidences.get(i, 0.0)
+                    })
             
-            #if current_entity:
-            #    entities.append(current_entity)
+            # ✅ CRITICAL ADDITION: If no FIELD entities found, add rule-based ones
+            field_entities = [e for e in entities if e["label"] == "FIELD"]
             
-            logger.info(f"Model extracted {len(entities)} entities")
-            return entities
+            if len(field_entities) < 3:
+                logger.warning(f"Only {len(field_entities)} FIELD entities - augmenting with rule-based")
+                
+                # Get rule-based entities too
+                rule_entities = self._process_with_rules(words, bboxes)
+                
+                # Add rule-based FIELD entities that aren't already covered
+                existing_texts = set(e["text"].lower() for e in entities)
+                for rule_ent in rule_entities:
+                    if rule_ent["type"] == "FIELD" and rule_ent["text"].lower() not in existing_texts:
+                        entities.append(rule_ent)
+                        logger.info(f"Added rule-based field: {rule_ent['text']}")
+            
+            # ✅ Filter low-confidence entities (use lower threshold)
+            filtered_entities = [e for e in entities if e.get("confidence", 0.0) > 0.1]  # Changed from 0.3
+            
+            # Log results
+            field_count = len([e for e in filtered_entities if e["label"] == "FIELD"])
+            logger.info(f"Final: {len(filtered_entities)} entities ({field_count} FIELD entities)")
+            
+            return filtered_entities
             
         except Exception as e:
             logger.error(f"Model processing error: {e}")
+            import traceback
+            traceback.print_exc()
             return self._process_with_rules(words, bboxes)
-    
+        
     def _process_with_rules(self, words: List[str], bboxes: List[List[int]]) -> List[Dict]:
-        """Fallback processing with rule-based approach"""
+        """Process each word as a separate entity (NO MERGING)"""
         if not words:
             return []
-            
+        
         entities = []
-        full_text = ' '.join(words).lower()
         
         # Define field patterns
         field_patterns = {
@@ -272,249 +484,43 @@ class SimpleLiLTProcessor:
             ]
         }
         
-        # Look for field patterns in text
-        current_entity = None
-        current_type = None
-        
         for i, word in enumerate(words):
             if i >= len(bboxes):
                 break
-                
-            word_lower = word.lower()
-            found = False
-            entity_type = None
             
-            # Check for patterns
+            word_lower = word.lower()
+            entity_type = "O"  # Default: outside any field
+            
+            # Check patterns to determine entity type
             for pattern in field_patterns["CHECKBOX"]:
                 if re.search(pattern, word_lower):
-                    found = True
                     entity_type = "CHECKBOX"
                     break
             
-            if not found:
+            if entity_type == "O":
                 for pattern in field_patterns["FIELD"]:
                     if re.search(pattern, word_lower):
-                        found = True
                         entity_type = "FIELD"
                         break
             
-            if not found:
+            if entity_type == "O":
                 for pattern in field_patterns["HEADER"]:
                     if re.search(pattern, word_lower):
-                        found = True
                         entity_type = "HEADER"
                         break
             
-            if found:
-                # Start or extend entity
-                if current_entity and current_type == entity_type:
-                    current_entity["text"] += " " + word
-                    current_entity["words"].append(word)
-                else:
-                    if current_entity:
-                        entities.append(current_entity)
-                    current_entity = {
-                        "text": word,
-                        "label": entity_type,
-                        "type": entity_type,
-                        "words": [word],
-                        "bbox": bboxes[i] if i < len(bboxes) else [0, 0, 0, 0]
-                    }
-                    current_type = entity_type
-            elif current_entity:
-                # Continue if short word (likely part of phrase)
-                if len(word) < 8:
-                    current_entity["text"] += " " + word
-                    current_entity["words"].append(word)
-                else:
-                    entities.append(current_entity)
-                    current_entity = None
-                    current_type = None
+            # ✅ CRITICAL: CREATE NEW ENTITY FOR EVERY WORD (NO MERGING)
+            entities.append({
+                "text": word,
+                "label": entity_type,
+                "type": entity_type,
+                "words": [word],  # Single-word entity
+                "bbox": bboxes[i] if i < len(bboxes) else [0, 0, 0, 0]
+            })
         
-        if current_entity:
-            entities.append(current_entity)
-        
-        logger.info(f"Rule-based extracted {len(entities)} entities")
+        logger.info(f"Rule-based extracted {len(entities)} entities (no merging)")
         return entities
-
-class OCRProcessor:
-    """OCR processor for text extraction with fixed regex"""
-    
-    def __init__(self):
-        self.reader = None
-        self._init_ocr()
-    
-    def _init_ocr(self):
-        """Initialize OCR reader"""
-        try:
-            if not EASYOCR_AVAILABLE:
-                logger.error("EasyOCR not available")
-                return False
-            
-            # Initialize with English only
-            self.reader = easyocr.Reader(
-                ['en'],
-                gpu=torch.cuda.is_available() if TORCH_AVAILABLE else False,
-                download_enabled=True
-            )
-            logger.info("EasyOCR initialized successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize OCR: {e}")
-            return False
-    
-    def extract_text(self, image: Image.Image) -> Tuple[List[str], List[List[int]], str]:
-        """Extract text and bounding boxes"""
-        try:
-            if not self.reader:
-                logger.error("OCR not initialized")
-                return [], [], ""
-            
-            # Convert PIL Image to numpy array
-            img_array = np.array(image)
-            
-            # Ensure image is in RGB
-            if len(img_array.shape) == 2:
-                img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
-            elif img_array.shape[2] == 4:
-                img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
-            
-            # Run OCR with simpler parameters to avoid warnings
-            try:
-                results = self.reader.readtext(
-                    img_array,
-                    paragraph=False,
-                    batch_size=1,
-                    y_ths=0.5,
-                    x_ths=1.0,
-                    decoder='greedy',
-                    min_size=10,
-                    contrast_ths=0.3,
-                    text_threshold=0.5,
-                    low_text=0.3,
-                    link_threshold=0.4,
-                    mag_ratio=1.0
-                )
-            except Exception as e:
-                logger.warning(f"EasyOCR readtext failed: {e}, using simpler approach")
-                # Try with minimal parameters
-                results = self.reader.readtext(img_array, paragraph=False)
-            
-            words = []
-            bboxes = []
-            
-            for result in results:
-                if len(result) >= 2:
-                    bbox = result[0]
-                    text = result[1]
-                    
-                    # Clean text
-                    clean_text = self._clean_text(text)
-                    if not clean_text or len(clean_text.strip()) == 0:
-                        continue
-                    
-                    # Get bounding box coordinates
-                    try:
-                        x_coords = [point[0] for point in bbox]
-                        y_coords = [point[1] for point in bbox]
-                        
-                        # Create bounding box [x1, y1, x2, y2]
-                        bbox_coords = [
-                            int(min(x_coords)),
-                            int(min(y_coords)),
-                            int(max(x_coords)),
-                            int(max(y_coords))
-                        ]
-                        
-                        # Skip very small boxes
-                        box_width = bbox_coords[2] - bbox_coords[0]
-                        box_height = bbox_coords[3] - bbox_coords[1]
-                        if box_width < 5 or box_height < 5:
-                            continue
-                        
-                        words.append(clean_text)
-                        bboxes.append(bbox_coords)
-                    except Exception as e:
-                        logger.warning(f"Failed to process bbox: {e}")
-                        continue
-            
-            full_text = ' '.join(words)
-            
-            logger.info(f"OCR extracted {len(words)} words")
-            return words, bboxes, full_text
-            
-        except Exception as e:
-            logger.error(f"OCR extraction failed: {e}")
-            return [], [], ""
-    
-    def _clean_text(self, text: str) -> str:
-        """Clean OCR text with fixed regex patterns"""
-        if not text:
-            return ""
-        
-        try:
-            # Remove non-ASCII characters
-            text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-            
-            # Common OCR corrections
-            corrections = {
-                'DONARYYYY': 'DD/MM/YYYY',
-                'cornpletion': 'completion',
-                'Completlon': 'Completion',
-                'Dafe': 'Date',
-                'organizatlon': 'organization',
-                'facillty': 'facility',
-                'certlflcate': 'certificate',
-                'reglstratlon': 'registration',
-                'replalcement': 'replacement',
-                'appllcant': 'applicant',
-                'authorlzed': 'authorized',
-                'valldity': 'validity',
-                'approval': 'approval',
-                'confldentlal': 'confidential',
-                'offlclal': 'official',
-                'dlrectlon': 'direction',
-                'necessaly': 'necessary',
-                'approprlate': 'appropriate',
-                'lndlcate': 'indicate',
-                'requesled': 'requested',
-                'sectlon': 'section',
-                'progldm': 'program',
-                'regulrement': 'requirement',
-                'complete': 'complete',
-                'submlt': 'submit',
-                'Te1.': 'Tel.'
-            }
-            
-            # Apply corrections (case-insensitive)
-            for wrong, correct in corrections.items():
-                # Use re.escape to handle special characters and compile pattern once
-                pattern = re.compile(re.escape(wrong), re.IGNORECASE)
-                text = pattern.sub(correct, text)
-            
-            # Fix common OCR issues with numbers and dates using lambda functions
-            # Fix 0 vs O: pattern like "1O2" -> "102"
-            text = re.sub(r'(\d)[Oo](\d)', lambda m: m.group(1) + '0' + m.group(2), text)
-            
-            # Fix 1 vs I/l: pattern like "A1B" -> "A1B" (no change if already correct)
-            # Actually detect patterns like "AIB" -> "A1B" or "AlB" -> "A1B"
-            text = re.sub(r'(\d)[Il](\d)', lambda m: m.group(1) + '1' + m.group(2), text)
-            
-            # Fix common OCR errors with letters
-            text = re.sub(r'[Il]\s*[\.,]', '1.', text)  # I. or l. -> 1.
-            text = re.sub(r'\b[Oo]\b', '0', text)  # Single O -> 0
-            
-            # Remove extra whitespace
-            text = re.sub(r'\s+', ' ', text).strip()
-            
-            return text
-            
-        except Exception as e:
-            logger.warning(f"Text cleaning error: {e}")
-            # Return original text if cleaning fails
-            return text.strip()
-
+           
 class DocumentFieldExtractor:
     """Main field extractor"""
     
@@ -526,12 +532,57 @@ class DocumentFieldExtractor:
             model_path: Path to model directory
         """
         self.model_path = model_path
-        self.ocr_processor = OCRProcessor()
         self.lilt_processor = SimpleLiLTProcessor(model_path)
         self.page_count = 0  # ✅ FIX 1: Store actual page count
         
         logger.info(f"DocumentFieldExtractor initialized with model path: {model_path}")
-    
+
+    def load_words_and_bboxes_from_json(self, json_path: str, page: int) -> Tuple[List[str], List[List[int]]]:
+        """
+        Load result2.json and return words/bboxes ONLY for specific page number.
+        
+        Args:
+            json_path: Path to result2.json
+            page: Page number (1-based) to filter associations
+        
+        Returns:
+            words: List of text strings for that page only
+            bboxes: List of [x1, y1, x2, y2] for that page only
+        """
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        associations = data.get("associations", [])
+        words: List[str] = []
+        bboxes: List[List[int]] = []
+
+        # Filter by page number (assumes assoc has "page_number" field)
+        for assoc in associations:
+            text = assoc.get("text", "")
+            bbox = assoc.get("bbox", None)
+            page_num = assoc.get("page_number", 1)  # Default to page 1
+            
+            # Skip if not target page OR invalid data
+            if page_num != page or not text or not bbox or len(bbox) != 4:
+                continue
+
+            words.append(text)
+            bboxes.append([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])])
+
+        logger.info(f"Page {page}: loaded {len(words)} words")
+        return words, bboxes
+
+    def get_page_info(self, json_path: str) -> Tuple[int]:
+        """
+        Return (current_page, total_pages) from a JSON file.
+        Assumes JSON has keys: 'total_pages' at top level.
+        """
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        total_pages = int(data.get("total_pages", 1))
+        return total_pages
+
     def extract_fields(self, document_path: str) -> List[str]:
         """
         Extract all fields from document
@@ -544,130 +595,44 @@ class DocumentFieldExtractor:
         """
         logger.info(f"Extracting fields from: {document_path}")
         
-        # Load and process document
-        images = self._load_document(document_path)
-        if not images:
-            logger.error("Failed to load document")
-            self.page_count = 1  # ✅ FIX 2: Set fallback page count
-            return self._get_fallback_fields()
-        
-        self.page_count = len(images)  # ✅ FIX 3: Store actual page count
-        
         all_fields = []
-        
-        for page_num, image in enumerate(images, 1):
+
+        total_pages = self.get_page_info(document_path)
+                         
+        for page_num in range(1, total_pages + 1):
             logger.info(f"Processing page {page_num}")
             
             # Extract OCR
-            words, bboxes, full_text = self.ocr_processor.extract_text(image)
-            
-            if not words:
-                logger.warning(f"No text found on page {page_num}")
-                # Try alternative processing
-                fields_from_image = self._extract_from_image_directly(image)
-                all_fields.extend(fields_from_image)
-                continue
+            words, bboxes = self.load_words_and_bboxes_from_json(document_path, page_num)
             
             # Process with model/rules
             entities = self.lilt_processor.process_document(words, bboxes)
-            
+
             # Extract fields from entities
-            page_fields = self._extract_fields_from_entities(entities, full_text)
+            page_fields = self._extract_fields_from_entities(entities)
+            
             all_fields.extend(page_fields)
             
             logger.info(f"Extracted {len(page_fields)} fields from page {page_num}")
         
-        # Clean and deduplicate
-        cleaned_fields = self._clean_and_deduplicate(all_fields)
-        
-        # If no fields found, use fallback
-        if not cleaned_fields:
-            cleaned_fields = self._get_fallback_fields()
+            # Clean and deduplicate
+            cleaned_fields = self._clean_and_deduplicate(all_fields)
+      
+            logger.info(f"Extracted {len(page_fields)} fields from page {page_num}")
+
+            # Clean and deduplicate
+            cleaned_fields = self._clean_and_deduplicate(all_fields)
+    
+            # If no fields found, use fallback
+            if not cleaned_fields:
+                cleaned_fields = self._get_fallback_fields()
+            
+            self.save_fields_per_page(cleaned_fields, page_num, total_pages)
         
         logger.info(f"Total fields extracted: {len(cleaned_fields)}")
         return cleaned_fields
-    
-    def _load_document(self, file_path: str) -> List[Image.Image]:
-        """Load document as images"""
-        try:
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            if file_ext == '.pdf':
-                if not PDF2IMAGE_AVAILABLE:
-                    logger.error("pdf2image not available for PDF processing")
-                    return []
-                
-                # Convert PDF to images
-                try:
-                    images = convert_from_path(
-                        file_path,
-                        dpi=150,  # Lower DPI for faster processing
-                        first_page=1,
-                        last_page=3,  # Process only first 3 pages
-                        fmt='jpeg'
-                    )
-                    logger.info(f"Converted PDF to {len(images)} pages")
-                    return images
-                except Exception as e:
-                    logger.error(f"PDF conversion failed: {e}")
-                    return []
-            else:
-                # Load as image
-                try:
-                    image = Image.open(file_path).convert('RGB')
-                    logger.info(f"Loaded image: {image.size}")
-                    return [image]
-                except Exception as e:
-                    logger.error(f"Failed to load image: {e}")
-                    return []
-                
-        except Exception as e:
-            logger.error(f"Failed to load document: {e}")
-            return []
-    
-    def _extract_from_image_directly(self, image: Image.Image) -> List[str]:
-        """Extract fields directly from image when OCR fails"""
-        # Simple pattern matching on image
-        fields = []
-        
-        # Convert to grayscale and threshold
-        img_array = np.array(image)
-        if len(img_array.shape) == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_array
-        
-        # Look for checkboxes (small squares)
-        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        checkbox_count = 0
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / float(h)
-            area = w * h
-            
-            # Check if it looks like a checkbox (square, small area)
-            if 0.8 < aspect_ratio < 1.2 and 50 < area < 500:
-                checkbox_count += 1
-        
-        if checkbox_count > 0:
-            fields.append(f"✓ Found {checkbox_count} checkbox(es)")
-        
-        # Add common fields
-        common_fields = [
-            "✓ Loss of Certificate",
-            "✓ Replacement Certificate",
-            "✓ Damage Certificate",
-            "✓ Deletion of Facility",
-            "Completion Date",
-            "Applicant Name"
-        ]
-        
-        fields.extend(common_fields)
-        return fields
-    
-    def _extract_fields_from_entities(self, entities: List[Dict], full_text: str) -> List[str]:
+       
+    def _extract_fields_from_entities(self, entities: List[Dict]) -> List[str]:
         """Extract fields from processed entities"""
         fields = []
         
@@ -687,47 +652,107 @@ class DocumentFieldExtractor:
             if entity_type == "CHECKBOX":
                 fields.append(f"✓")
             elif entity_type == "FIELD":
-                fields.append(clean_text)
-            elif entity_type == "HEADER":
-                fields.append(f"# {clean_text}")
+                fields.append(entity_text)
+            #elif entity_type == "HEADER":
+            #    fields.append(f"# {clean_text}")
         
         return fields
     
     def _clean_field_text(self, text: str) -> str:
-        """Clean and format field text"""
+        """Clean and format field text (with suffix cleaning)"""
         if not text:
             return ""
         
-        # Remove common instruction words
+        # Remove common instruction words (prefixes)
         prefixes = ["Please", "Kindly", "Enter", "Provide", "Select", "Choose", 
-                   "Indicate", "Specify", "Write", "Fill", "Mark", "Tick",
-                   "Check", "Sign", "Date", "Print", "Attach", "Submit",
-                   "Complete", "Include", "List", "Note", "Ensure"]
-        
-        # Remove trailing punctuation
-       # text = text.rstrip(' :;,.?!-–—')
+                "Indicate", "Specify", "Write", "Fill", "Mark", "Tick",
+                "Check", "Sign", "Date", "Print", "Attach", "Submit",
+                "Complete", "Include", "List", "Note", "Ensure", "此欄不用",
+                "FORM", "Change", "All Sections", "INFORMATION CHANGE", "Responsible For", ".", "OF"
+        ]
         
         # Check if text starts with a prefix and remove it
         for prefix in prefixes:
             if text.lower().startswith(prefix.lower()):
                 # Remove the prefix and any following whitespace/colon
-                #text = text[len(prefix):].lstrip(' :')
+                text = text[len(prefix):].lstrip(' :')
                 break
+        
+        # ✅ CRITICAL ADDITION: Clean noise suffixes from END of text
+        # Remove trailing punctuation first
+        text = text.rstrip(' :;,.?!-–—')
+        
+        # Define suffix words to remove (common prepositions/articles unlikely to end GF2 field labels)
+        # These often appear due to OCR fragmentation or layout artifacts
+        suffix_words = ["Etc.", "For Example", "NOTIFICATION", "REGULATIONS"
+        ]
+        
+        words = text.split()
+        
+        # Remove suffix words from the END (keep at least one word to avoid empty strings)
+        while len(words) > 1 and words[-1].lower() in suffix_words:
+            words.pop()
+        
+        # Special case: Remove trailing "no" without period (OCR often misses the period)
+        if len(words) > 1 and words[-1].lower() == "no" and not words[-1].endswith('.'):
+            words.pop()
+            # Add proper "No." suffix if this was part of a field label like "Tel No"
+            if words and words[-1].lower() in ["tel", "phone", "fax", "contact"]:
+                words.append("No.")
+        
+        text = ' '.join(words)
         
         # Capitalize first letter of each word
         words = text.split()
         capitalized = []
         for word in words:
             if word:
-                capitalized.append(word[0].upper() + word[1:])
+                # Preserve acronyms (e.g., "GF2" not "Gf2")
+                if word.isupper() and len(word) <= 4:
+                    capitalized.append(word)
+                else:
+                    capitalized.append(word[0].upper() + word[1:])
         
         text = ' '.join(capitalized)
         
         # Remove extra whitespace
         text = re.sub(r'\s+', ' ', text).strip()
         
+        # ✅ FINAL SAFETY: Fix common GF2 field label artifacts
+        # "Tel No" → "Tel No." (add missing period)
+        if text.lower().endswith(" tel no") or text.lower().endswith("tel no"):
+            text = re.sub(r'(Tel\s+No)$', r'\1.', text, flags=re.IGNORECASE)
+        
+        # "Email Address Of The" → "Email Address" (remove trailing prepositions)
+        text = re.sub(r'\s+(of|the|and|or|to|for|in|on|at|by|with|from)$', '', text, flags=re.IGNORECASE)
+        
         return text
-    
+
+    def filter_prefix_suffix(self, text: str, prefixes: list[str], suffixes: list[str]) -> str:
+        """
+        Returns "" if text has ANY prefix OR suffix match, else returns original text.
+        
+        >>> filter_prefix_suffix("abc_test", ["abc"], ["test"])
+        ""
+        >>> filter_prefix_suffix("hello", ["hi"], ["bye"])  
+        "hello"
+        """
+        text = text.strip()
+        if not text:
+            return ""
+        
+        # Check prefixes
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                return ""
+        
+        # Check suffixes  
+        for suffix in suffixes:
+            if text.endswith(suffix):
+                return ""
+        
+        return text
+
     def _clean_and_deduplicate(self, fields: List[str]) -> List[str]:
         """Clean and remove duplicate fields"""
         if not fields:
@@ -773,7 +798,6 @@ class DocumentFieldExtractor:
         other_fields.sort(key=lambda x: x.lower())
         
         return checkbox_fields + other_fields
-        #return checkbox_fields + header_fields + other_fields
     
     def _get_fallback_fields(self) -> List[str]:
         """Get fallback fields when extraction fails"""
@@ -781,33 +805,36 @@ class DocumentFieldExtractor:
         ]
     
     # ✅ ADDITION 1: New method to save page-specific fields with markers
-    def save_fields_per_page(self, fields: List[str], output_file: str = "extracted_fields.txt") -> bool:
+    def save_fields_per_page(self, fields: List[str], page_num: int, total_pages: int, output_file: str = "extracted_fields.txt") -> bool:
         """Save EXACT SAME fields for every page with page markers (FORM GF2 has identical fields per page)"""
+        bad_prefixes = ["FORM", "responsible", "Only", "facility", "Change"]
+        bad_suffixes = [")", "facility)", "FACILITIES", "OF", "REGULATIONS"]
+
         try:
             # ✅ CRITICAL FIX: Replicate EXACT processing from save_fields() to get identical field lines
             result = []
             for line in fields:
                 line = line.strip()
-                if len(line.split()) > 20:
-                    continue
+
                 if line == "✓":
                     result.append("✓")
+                elif line.endswith(":"):
+                    # Remove trailing colon and add directly
+                    logger.info(f"Pattern in line: {line}")
+                    clean_field = line.rstrip(":").strip()
+                    if len(clean_field) >= 1:  # At least 1 char before colon
+                        clean = self.filter_prefix_suffix(clean_field, bad_prefixes, bad_suffixes)
+                        if clean:
+                            result.append(clean)
+                    else:
+                        logger.warning(f"Empty field after colon removal: {line}")
+                        result.append(line)
                 else:
-                    parts = re.findall(r'[^:]*?:', line)
-                    cleaned = [p.strip() for p in parts]
-                    valid = []
-                    for p in cleaned:
-                        if len(p) >= 2 and p.endswith(':'):
-                            field_name = p.rstrip(':').strip()
-                            words = field_name.split()
-                            if words and words[-1] == "No":
-                                words[-1] = "No."
-                                field_name = " ".join(words)
-                            valid.append(field_name)
-                    result.extend(valid)
-            
-            # Hardcode 2 pages (FORM GF2 is always 2 pages)
-            total_pages = self.page_count if self.page_count > 0 else 1  # ✅ FIX 4: Use actual page count (no hardcoding)
+                    # No special handling needed - add directly
+                    logger.info(f"No pattern in line: {line}")
+                    clean = self.filter_prefix_suffix(line, bad_prefixes, bad_suffixes)
+                    if clean:
+                        result.append(clean)
             
             with open(output_file, 'w', encoding='utf-8') as f:
                 for page_num in range(1, total_pages + 1):
@@ -827,59 +854,6 @@ class DocumentFieldExtractor:
             
         except Exception as e:
             logger.error(f"Failed to save fields per page: {e}")
-            return False
-    
-    # ✅ ADDITION 2: Modified save_fields to also generate page-specific version
-    def save_fields(self, fields: List[str], output_file: str = "fields.txt") -> bool:
-        """Save fields to file (flat list) AND save page-specific version"""
-        try:
-            result = []
-            for line in fields:
-                line = line.strip()
-                if len(line.split()) > 20:
-                    continue
-                if line == "✓":
-                    result.append("✓")
-                else:
-                    # Find all minimal substrings ending with ':'
-                    parts = re.findall(r'[^:]*?:', line)
-                    cleaned = [p.strip() for p in parts]
-                    # Keep only meaningful field labels: must end with ':' and have >=1 char before it
-                    valid = []
-                    for p in cleaned:
-                        if len(p) >= 2 and p.endswith(':'):
-                            # Remove trailing colon
-                            field_name = p.rstrip(':').strip()
-                            
-                            # Check if last word is "No" and ends with period
-                            words = field_name.split()
-                            if words and words[-1] == "No":
-                                # Replace "No" with "No."
-                                words[-1] = "No."
-                                field_name = " ".join(words)
-                            
-                            valid.append(field_name)
-
-                    result.extend(valid)
-                    
-            # Filter for checkbox fields only
-            checkbox_fields = [f for f in result if f.startswith('✓')]
-            checkbox_fields = result
-            with open(output_file, 'w', encoding='utf-8') as f:
-                if checkbox_fields:
-                    for field in checkbox_fields:
-                        f.write(f"{field}\n")
-            
-            logger.info(f"Saved {len(checkbox_fields)} checkbox fields to {output_file}")
-            
-            # ✅ ADDITION 3: Auto-generate page-specific version
-            page_output = "extracted_fields.txt"
-            self.save_fields_per_page(fields, page_output)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to save fields: {e}")
             return False
     
 def main():
@@ -924,7 +898,7 @@ Examples:
         return 1
     
     # Check if it's a supported file type
-    supported_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp']
+    supported_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.json']
     file_ext = os.path.splitext(args.document)[1].lower()
     if file_ext not in supported_extensions:
         print(f"ERROR: Unsupported file type: {file_ext}")
@@ -949,19 +923,19 @@ Examples:
         fields = extractor.extract_fields(args.document)
         
         # Save to file (now auto-generates page-specific version too)
-        print("Saving to file...")
-        success = extractor.save_fields(fields, args.output)
+        #print("Saving to file...")
+        #success = extractor.save_fields_per_page(fields, args.output)
         
-        if success:
-            elapsed = time.time() - start_time
-            print(f"\n✅ Successfully extracted {len(fields)} fields")
-            print(f"✅ Saved to: {args.output}")
-            print(f"✅ Page-specific version saved to: extracted_fields.txt")
-            print(f"⏱️  Processing time: {elapsed:.2f} seconds")
-            return 0
-        else:
-            print("\n❌ Failed to save fields")
-            return 1
+        #if success:
+        #    elapsed = time.time() - start_time
+        #    print(f"\n✅ Successfully extracted {len(fields)} fields")
+        #    print(f"✅ Saved to: {args.output}")
+        #    print(f"✅ Page-specific version saved to: extracted_fields.txt")
+        #    print(f"⏱️  Processing time: {elapsed:.2f} seconds")
+        #    return 0
+        #else:
+        #    print("\n❌ Failed to save fields")
+        #    return 1
             
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user.")
